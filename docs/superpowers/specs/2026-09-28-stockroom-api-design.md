@@ -87,7 +87,7 @@ All tables are created by Flyway migrations (`V1__init.sql` and so on). IDs are 
 | `product` | id, shop_id → shop, sku, name, price, stock_qty, low_stock_threshold, active, created_at, updated_at | `UNIQUE (shop_id, sku)` and `UNIQUE (id, shop_id)`. `price` is `NUMERIC(12,2)` with `CHECK (price >= 0)`. `stock_qty` has `CHECK (stock_qty >= 0)`. `low_stock_threshold` has `CHECK (>= 0)` and defaults to 5. `active` defaults to true. |
 | `customer_order` | id, shop_id → shop, status, total, created_by, created_at, cancelled_at | `status` is `PLACED` or `CANCELLED`. `total` is `NUMERIC(12,2)`. `UNIQUE (id, shop_id)`. `(created_by, shop_id)` → `app_user (id, shop_id)`. The table is not named `order` because that is a reserved word in SQL. |
 | `order_item` | id, **shop_id**, order_id, product_id, quantity, unit_price | `(order_id, shop_id)` → `customer_order (id, shop_id)`. `(product_id, shop_id)` → `product (id, shop_id)`. `quantity` has `CHECK (quantity > 0)`. `unit_price` is the price at the time of sale. |
-| `stock_movement` | id, shop_id, product_id, change, reason, order_id (nullable), created_by, created_at | `(product_id, shop_id)` → `product (id, shop_id)`. `(order_id, shop_id)` → `customer_order (id, shop_id)` when `order_id` is not null. `(created_by, shop_id)` → `app_user (id, shop_id)`. `change` is a non-zero integer. `reason` is `OPENING_STOCK`, `RESTOCK`, `SALE` or `CANCEL`. (A manual-correction reason can be added with a future stock-correction feature; Phase 1 has nothing that would write it.) Rows are append-only and never updated or deleted. |
+| `stock_movement` | id, shop_id, product_id, change, reason, order_id (nullable), note (nullable, up to 200 characters, set by restock), created_by, created_at | `(product_id, shop_id)` → `product (id, shop_id)`. `(order_id, shop_id)` → `customer_order (id, shop_id)` when `order_id` is not null. `(created_by, shop_id)` → `app_user (id, shop_id)`. `change` is a non-zero integer. `reason` is `OPENING_STOCK`, `RESTOCK`, `SALE` or `CANCEL`. (A manual-correction reason can be added with a future stock-correction feature; Phase 1 has nothing that would write it.) Rows are append-only and never updated or deleted. |
 
 **Tenant-aware foreign keys.** Every row that points at another tenant-owned row carries `shop_id`. The foreign key covers **both** the ID and `shop_id`, so it points at the pair `(id, shop_id)` in the parent table. The database therefore **rejects** an order line or stock movement that points at another shop's product, order or user, even if a bug in the Java code tries to write one. Isolation of reads still depends on the application: every query filters by `shopId` (section 6). Row-level security (RLS) would enforce reads in the database too; it is deliberately left as later hardening.
 
@@ -141,7 +141,7 @@ The base path is `/api`, and all requests and responses are JSON. Authentication
 
 ### Rule: JPA never writes `stock_qty`
 
-All stock changes go through **one class, `StockRepository`**. It has three methods: `deduct`, `add` and `setOpening`. Each one runs a single SQL `UPDATE` plus the matching `stock_movement` insert. Nothing else in the codebase changes stock. Three safeguards make JPA's in-memory state safe around those direct updates:
+All stock changes go through **one class, `StockRepository`**. It has four methods: `deduct` (sale), `restock`, `returnStock` (cancellation) and `recordOpeningStock`. Each of the first three runs a single SQL `UPDATE` plus the matching `stock_movement` insert. `recordOpeningStock` only writes the `OPENING_STOCK` movement, because the opening value is set when the product is inserted. Nothing else in the codebase changes stock. Three safeguards make JPA's in-memory state safe around those direct updates:
 
 1. **The `Product` entity maps `stock_qty` with `@Column(insertable = true, updatable = false)`.** Hibernate can set the opening value on insert, but never includes `stock_qty` in an `UPDATE`.
    - This closes a lost-update bug that also exists **across** transactions, not only inside one. `PUT /products/{id}` loads a product with stock 5. A concurrent order then commits stock 3. Without this mapping, Hibernate's default full-row `UPDATE` for the `PUT` would write the stale 5 back and silently erase the sale.
@@ -218,7 +218,7 @@ A conditional update adds the quantity, and a `RESTOCK` movement is recorded in 
 
 - **Roles** map to authorities (`ROLE_OWNER`, `ROLE_STAFF`). Owner-only methods use `@PreAuthorize("hasRole('OWNER')")`.
 - **Tenant isolation:**
-  - `shopId` is taken **only** from the validated token, through a single `CurrentUser` component. It is never taken from the request path, body or query.
+  - `shopId` is taken **only** from the validated token, through a single factory method, `AuthUser.from(jwt)`. It is never taken from the request path, body or query.
   - Every repository method used by services takes `shopId` and filters by it.
   - A cross-shop access returns **404, not 403**, so the API doesn't reveal that the resource exists.
 
@@ -263,7 +263,7 @@ Every error is an RFC 9457 `ProblemDetail` with an extra `code` property. Errors
 - **Integration tests** (`@SpringBootTest` + MockMvc against a real PostgreSQL test database, cleaned between tests):
   - every endpoint's success path and its documented error codes
   - security: the five token cases from section 6 (each checking status **and** JSON shape), and identical login failure responses
-  - **cross-shop isolation for reads and writes.** Shop B's owner and staff try, against shop A's resources: to read, update, archive and restock a product; to place an order containing shop A's product ID; and to read and cancel shop A's order. Every attempt must return 404, and afterwards shop A's data (stock, movements, orders) must be unchanged.
+  - **cross-shop isolation for reads and writes.** Shop B's owner and staff try, against shop A's resources: to read, update, archive and restock a product; to place an order containing shop A's product ID; and to read and cancel shop A's order. Every attempt by shop B's **owner** must return 404. Shop B's **staff** get 404 on the endpoints staff may use, and 403 on owner-only endpoints, because the role check runs before any lookup, so the 403 reveals nothing about shop A's data. Afterwards, shop A's data (stock, movements, orders) must be unchanged.
   - **the database backstop:** a repository-level test tries to insert an `order_item` and a `stock_movement` that point at another shop's product, bypassing the service. The tenant-aware foreign key must reject both.
 - **Concurrency test:** a product has stock 5. 20 threads each place an order for 1 unit through the service at the same time. Exactly 5 succeed, 15 get `InsufficientStockException`, the final stock is 0, and there are exactly 5 `SALE` movements.
 - **Lock-ordering test:** two threads repeatedly place orders for products {A, B} and {B, A}, while a third thread cancels earlier orders. There must be no deadlock errors across 100 iterations. This proves the ordering rule for today's writers; it is not a proof that deadlocks are impossible.
@@ -293,9 +293,9 @@ Every error is an RFC 9457 `ProblemDetail` with an extra `code` property. Errors
 - **Settings:** `JWT_SECRET`, `DB_URL`, `DB_USER`, `DB_PASSWORD` and `SPRING_PROFILES_ACTIVE=prod,demo`.
 - **Migrations:** Flyway runs automatically on startup.
 - **Demo data: seeded once, never reset automatically.**
-  - The `demo` profile runs an idempotent seeder on startup. If the shop "Demo Sari-Sari Store" doesn't exist, it creates the shop, one OWNER, one STAFF and about 15 products. If the shop already exists, **it does nothing**: it never resets data or changes passwords, so a deploy can't disrupt someone who is using the demo.
+  - The `demo` profile runs an idempotent seeder on startup. The demo shop is identified by its owner's email, `owner@demo.stockroom.dev`. Emails are globally unique, so nobody else can register it once the demo exists. If that user doesn't exist, the seeder creates the shop "Demo Sari-Sari Store", one OWNER, one STAFF and 15 products. If it already exists, **it does nothing**: it never resets data or changes passwords, so a deploy can't disrupt someone who is using the demo.
   - The demo profile is enabled only on the single public demo deployment, which **is** the demo environment and holds no real shop data. Any real deployment for a customer runs without `demo`.
-  - **Reset is a manual, guarded operation:** a SQL script in `ops/reset-demo.sql` that deletes only rows whose `shop_id` is the demo shop's. It refuses to run unless that shop exists and its name matches exactly. It is run by hand when needed, never by CI.
+  - **Reset is a manual, guarded operation:** a SQL script in `ops/reset-demo.sql` that deletes only rows whose `shop_id` is the demo shop's. It finds that shop through the owner email **and** requires the shop name to match exactly; otherwise it raises an error and deletes nothing. It is run by hand when needed, never by CI.
   - The demo logins are in the README.
 - **Cost gate:** no Azure resource is created until the author has seen the expected monthly cost and approved it.
 
