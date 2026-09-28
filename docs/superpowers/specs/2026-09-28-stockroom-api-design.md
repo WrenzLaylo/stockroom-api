@@ -1,7 +1,7 @@
 # Stockroom API: Design Spec (Phase 1)
 
 - **Date:** 2026-09-28
-- **Status:** Revised after review 1 (see section 10); awaiting the author's approval
+- **Status:** Revised after reviews 1 and 2 (see section 10); approved by the author
 - **Author:** Wrenz Ivan M. Laylo (design drafted with Claude)
 - **Reviewer:** GPT 6 Astra
 
@@ -82,10 +82,10 @@ All tables are created by Flyway migrations (`V1__init.sql` and so on). IDs are 
 
 | Table | Columns | Constraints and notes |
 |---|---|---|
-| `shop` | id, name, created_at | `name` is not null, 1–120 characters |
+| `shop` | id, name, is_demo, created_at | `name` is not null, 1–120 characters. `is_demo` defaults to false and is set only by the demo seeder (no API writes it); at most one shop can have it (`uq_shop_single_demo`). |
 | `app_user` | id, shop_id → shop, email, password_hash, role, created_at | `email` is unique globally (case-insensitive, stored lowercase). **Product constraint: one email belongs to exactly one shop.** Changing that later changes how login identifies people, so it is a deliberate decision. `role` is `OWNER` or `STAFF`. Passwords are stored as BCrypt hashes only. `UNIQUE (id, shop_id)` (see "Tenant-aware foreign keys" below). |
 | `product` | id, shop_id → shop, sku, name, price, stock_qty, low_stock_threshold, active, created_at, updated_at | `UNIQUE (shop_id, sku)` and `UNIQUE (id, shop_id)`. `price` is `NUMERIC(12,2)` with `CHECK (price >= 0)`. `stock_qty` has `CHECK (stock_qty >= 0)`. `low_stock_threshold` has `CHECK (>= 0)` and defaults to 5. `active` defaults to true. |
-| `customer_order` | id, shop_id → shop, status, total, created_by, created_at, cancelled_at | `status` is `PLACED` or `CANCELLED`. `total` is `NUMERIC(12,2)`. `UNIQUE (id, shop_id)`. `(created_by, shop_id)` → `app_user (id, shop_id)`. The table is not named `order` because that is a reserved word in SQL. |
+| `customer_order` | id, shop_id → shop, status, total, created_by, created_at, cancelled_at | `status` is `PLACED` or `CANCELLED`. `total` is `NUMERIC(14,2)`: the largest valid order (50 lines × 1,000 units × 999,999.99) is about 5 × 10¹⁰, more than `NUMERIC(12,2)` can hold. `UNIQUE (id, shop_id)`. `(created_by, shop_id)` → `app_user (id, shop_id)`. The table is not named `order` because that is a reserved word in SQL. |
 | `order_item` | id, **shop_id**, order_id, product_id, quantity, unit_price | `(order_id, shop_id)` → `customer_order (id, shop_id)`. `(product_id, shop_id)` → `product (id, shop_id)`. `quantity` has `CHECK (quantity > 0)`. `unit_price` is the price at the time of sale. |
 | `stock_movement` | id, shop_id, product_id, change, reason, order_id (nullable), note (nullable, up to 200 characters, set by restock), created_by, created_at | `(product_id, shop_id)` → `product (id, shop_id)`. `(order_id, shop_id)` → `customer_order (id, shop_id)` when `order_id` is not null. `(created_by, shop_id)` → `app_user (id, shop_id)`. `change` is a non-zero integer. `reason` is `OPENING_STOCK`, `RESTOCK`, `SALE` or `CANCEL`. (A manual-correction reason can be added with a future stock-correction feature; Phase 1 has nothing that would write it.) Rows are append-only and never updated or deleted. |
 
@@ -139,7 +139,11 @@ The base path is `/api`, and all requests and responses are JSON. Authentication
 
 ## 5. Core logic: orders and stock
 
-### Rule: JPA never writes `stock_qty`
+### Rule: JPA never writes `stock_qty`, and saves only what changed
+
+`Product` is annotated `@DynamicUpdate`, so an UPDATE contains only the columns that actually changed. An edit can't write back a stale `active` (un-archiving a product), and an archive can't write back a stale name or price. Race tests cover both directions.
+
+**Limits:** prices are 0 to 999,999.99. Stock never exceeds `MAX_STOCK` = 1,000,000,000: restock refuses to go above it (409 `STOCK_LIMIT_EXCEEDED`), and opening stock is at most 1,000,000. JSON decimals sent for whole-number fields (quantities, IDs, thresholds) are rejected with 400, never truncated. A `null` order line is a 400. Cancellation can in theory push stock above `MAX_STOCK` after extreme restock-and-order cycles; that's accepted and documented, because INTEGER still has about 1.1 billion units of headroom.
 
 All stock changes go through **one class, `StockRepository`**. It has four methods: `deduct` (sale), `restock`, `returnStock` (cancellation) and `recordOpeningStock`. Each of the first three runs a single SQL `UPDATE` plus the matching `stock_movement` insert. `recordOpeningStock` only writes the `OPENING_STOCK` movement, because the opening value is set when the product is inserted. Nothing else in the codebase changes stock. Three safeguards make JPA's in-memory state safe around those direct updates:
 
@@ -248,6 +252,7 @@ Every error is an RFC 9457 `ProblemDetail` with an extra `code` property. Errors
 | 409 | `INSUFFICIENT_STOCK` | Includes `productId`, `requested` and `available` |
 | 409 | `ORDER_NOT_CANCELLABLE`, `DUPLICATE_SKU`, `EMAIL_TAKEN` | Business-rule conflicts. The two duplicate cases are mapped **by the name of the violated constraint** (`uq_product_shop_sku` → `DUPLICATE_SKU`, `uq_app_user_email` → `EMAIL_TAKEN`), taken from the underlying `ConstraintViolationException`. Any other integrity violation is a bug and becomes a logged 500, never a misleading 409. |
 | 409 | `CONCURRENT_UPDATE` | A PostgreSQL deadlock or serialization failure. The client may retry. |
+| 409 | `STOCK_LIMIT_EXCEEDED` | A restock would take stock above `MAX_STOCK` |
 | 429 | `RATE_LIMITED` | Login throttle |
 | 500 | `INTERNAL_ERROR` | A generic message. The stack trace is logged, never returned. |
 
@@ -343,3 +348,21 @@ Every error is an RFC 9457 `ProblemDetail` with an extra `code` property. Errors
 | Q4 | Global unique email | Stated as a deliberate product constraint (section 3). |
 | Q5 | `ADJUST` for initial stock | Renamed to `OPENING_STOCK`, and `ADJUST` dropped because nothing in Phase 1 writes it (sections 3 and 4). |
 | Q6 | Azure F1 reliability | Measure on F1 first; the author picks F1 or B1 with real numbers and the current price (section 8). |
+
+**Review 2: Hermes, 2026-09-28 (plan review; verified the Jackson coercion with a probe).** All findings were accepted. The Jackson finding and the `FlywayMigrationStrategy` location were re-verified against Boot 4.1.1.
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Editing a product can undo an archive, and vice versa | `@DynamicUpdate` on `Product`, plus deterministic race tests in both directions (section 5) |
+| 2 | Tests could wipe the wrong database | A separate `stockroom_test` role that can't connect to the dev database, and `TestDatabaseGuard` checks `current_database()` before Flyway and before every TRUNCATE, including in the demo tests |
+| 3 | Decimals are silently truncated (Jackson turned `1.9` into `1`) | A Jackson coercion config rejects decimals for whole-number fields; tests cover quantities, IDs, thresholds and restock |
+| 4 | `{"items":[null]}` causes a NullPointerException | `List<@NotNull @Valid OrderLineRequest>`, plus a test with no writes |
+| 5 | Valid input can overflow the money and stock columns | Price capped at 999,999.99, `total` widened to `NUMERIC(14,2)` with a test of an 11-billion total, and `MAX_STOCK` enforced on restock (409 `STOCK_LIMIT_EXCEEDED`) |
+| 6 | The demo identity is publicly claimable | The `@demo.stockroom.dev` domain is reserved at sign-up and staff creation; `shop.is_demo` (never API-writable) is the only thing the seeder and the reset trust; the seeder fails closed on a collision |
+| 7 | The cancel concurrency test can pass vacuously | Orders are pre-placed and all 50 must end up cancelled; a new test runs two cancels of the same order at once |
+| 8 | Impossible mutation-test instructions | One test per operation; the read and write break-it checks are separated and describe the real outcome (the FK backstop turns a leak into a 500) |
+| 9 | Worker cleanup | `awaitTermination` after each concurrency test; `statement_timeout` and `lock_timeout` on test connections |
+| D1 | Deploy rebuilt the jar with tests skipped | CI uploads the tested jar; deploy downloads exactly that artifact |
+| D2 | Overlapping or out-of-order deploys | A `concurrency` group, and deploys are skipped when `main` has moved past the run's commit |
+| D3 | The manual health loop never failed | It now exits non-zero after 30 tries |
+| D4 | Forwarded headers trusted from any caller | `stockroom.rate-limit.trust-forwarded-for`: false by default, true only in the `prod` profile (behind Azure's front end) |

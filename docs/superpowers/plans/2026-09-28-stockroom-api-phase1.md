@@ -32,7 +32,8 @@ All versions were verified on 2026-09-28 against start.spring.io and Maven Centr
 - **Errors:** every error response is a `ProblemDetail` with a top-level `code`, using the codes from spec section 7: `VALIDATION_FAILED`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `INSUFFICIENT_STOCK`, `ORDER_NOT_CANCELLABLE`, `DUPLICATE_SKU`, `EMAIL_TAKEN`, `CONCURRENT_UPDATE`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - **Constraint names:** exactly as in `V1__init.sql` (Task 1). The error mapping depends on `uq_product_shop_sku` and `uq_app_user_email`.
 - **Secrets:** never committed. `JWT_SECRET` must be at least 32 bytes, or the app refuses to start.
-- **Tests:** run against real PostgreSQL, never H2. The local test database is `stockroom_test` (user and password `stockroom`).
+- **Tests:** run against real PostgreSQL, never H2. The test database is `stockroom_test`, reached with user and password `stockroom_test`. That user can't connect to any other database. `TestDatabaseGuard` refuses to migrate or truncate unless `current_database()` is exactly `stockroom_test`.
+- **Numeric limits:** prices 0 to 999,999.99. Order totals are `NUMERIC(14,2)`. Stock can never exceed `StockRepository.MAX_STOCK` = 1,000,000,000. JSON decimals are **rejected** (400) for whole-number fields, never truncated.
 - **Commits:** end with the line `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - **Outward-facing steps are CHECKPOINTs.** The executor stops and asks Wrenz before running them: creating the public GitHub repo (Task 11), and creating any Azure resource (Task 13).
 
@@ -119,12 +120,20 @@ Expected: `psql (PostgreSQL) 16.x`. The `postgres` superuser password is the loc
 export PGPASSWORD=postgres
 PSQL="/c/Program Files/PostgreSQL/16/bin/psql"
 "$PSQL" -U postgres -h localhost -c "CREATE ROLE stockroom LOGIN PASSWORD 'stockroom'"
+"$PSQL" -U postgres -h localhost -c "CREATE ROLE stockroom_test LOGIN PASSWORD 'stockroom_test'"
 "$PSQL" -U postgres -h localhost -c "CREATE DATABASE stockroom_dev OWNER stockroom"
-"$PSQL" -U postgres -h localhost -c "CREATE DATABASE stockroom_test OWNER stockroom"
-PGPASSWORD=stockroom "$PSQL" -U stockroom -h localhost -d stockroom_test -c "select current_user, version()"
+"$PSQL" -U postgres -h localhost -c "CREATE DATABASE stockroom_test OWNER stockroom_test"
+"$PSQL" -U postgres -h localhost -c "REVOKE CONNECT ON DATABASE stockroom_dev FROM PUBLIC"
+"$PSQL" -U postgres -h localhost -c "REVOKE CONNECT ON DATABASE stockroom_test FROM PUBLIC"
+"$PSQL" -U postgres -h localhost -c "GRANT CONNECT ON DATABASE stockroom_dev TO stockroom"
+"$PSQL" -U postgres -h localhost -c "GRANT CONNECT ON DATABASE stockroom_test TO stockroom_test"
+PGPASSWORD=stockroom_test "$PSQL" -U stockroom_test -h localhost -d stockroom_test -c "select current_user, current_database()"
+PGPASSWORD=stockroom_test "$PSQL" -U stockroom_test -h localhost -d stockroom_dev -c "select 1"
 ```
 
-Expected: the last command prints `stockroom | PostgreSQL 16.…`.
+Expected:
+- The first query prints `stockroom_test | stockroom_test`.
+- The last command **fails** with `permission denied for database "stockroom_dev"`. The test user can't touch the dev database even if a test is misconfigured.
 
 ---
 
@@ -134,10 +143,13 @@ Expected: the last command prints `stockroom | PostgreSQL 16.…`.
 - Create (from start.spring.io): `pom.xml`, `mvnw`, `mvnw.cmd`, `.mvn/wrapper/maven-wrapper.properties`, `.gitignore`, `src/main/java/dev/wrenz/stockroom/StockroomApiApplication.java`
 - Delete: `src/main/resources/application.properties`, `src/test/java/dev/wrenz/stockroom/StockroomApiApplicationTests.java`, `HELP.md`
 - Create: `.gitattributes`, `src/main/resources/application.yml`, `src/main/resources/db/migration/V1__init.sql`, `src/test/resources/application-test.yml`
-- Test: `src/test/java/dev/wrenz/stockroom/support/IntegrationTest.java`, `src/test/java/dev/wrenz/stockroom/schema/SchemaConstraintsTest.java`
+- Test: `src/test/java/dev/wrenz/stockroom/support/TestDatabaseGuard.java`, `src/test/java/dev/wrenz/stockroom/support/TestDatabaseGuardTest.java`, `src/test/java/dev/wrenz/stockroom/support/IntegrationTest.java`, `src/test/java/dev/wrenz/stockroom/schema/SchemaConstraintsTest.java`
 
 **Interfaces:**
-- Produces: the database schema, and the abstract `IntegrationTest` base class (fields `MockMvc mvc` and `JdbcTemplate jdbc`; it truncates all tables before each test). Every later integration test extends it.
+- Produces:
+  - the database schema
+  - `TestDatabaseGuard`: a `@TestConfiguration` with a guarded `FlywayMigrationStrategy`, plus `static void requireTestDatabase(JdbcTemplate)`
+  - the abstract `IntegrationTest` base class (fields `MockMvc mvc` and `JdbcTemplate jdbc`). It imports the guard, re-checks the database, and truncates all tables before each test. Every later integration test extends it.
 
 - [ ] **Step 1: Generate the project into the repo (keeping the existing `docs/`)**
 
@@ -277,8 +289,11 @@ logging:
 spring:
   datasource:
     url: ${TEST_DB_URL:jdbc:postgresql://localhost:5432/stockroom_test}
-    username: ${TEST_DB_USER:stockroom}
-    password: ${TEST_DB_PASSWORD:stockroom}
+    username: ${TEST_DB_USER:stockroom_test}
+    password: ${TEST_DB_PASSWORD:stockroom_test}
+    hikari:
+      # A stuck concurrency test fails fast instead of hanging the build or overlapping the next test.
+      connection-init-sql: "SET statement_timeout = '30s'; SET lock_timeout = '15s'"
 
 stockroom:
   jwt:
@@ -295,8 +310,11 @@ stockroom:
 CREATE TABLE shop (
     id          BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
     name        VARCHAR(120) NOT NULL CONSTRAINT ck_shop_name CHECK (char_length(name) BETWEEN 1 AND 120),
+    -- Set only by DemoDataSeeder; no API can write it. The reset script trusts this flag, never names or emails.
+    is_demo     BOOLEAN      NOT NULL DEFAULT false,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX uq_shop_single_demo ON shop (is_demo) WHERE is_demo;
 
 CREATE TABLE app_user (
     id             BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -330,7 +348,8 @@ CREATE TABLE customer_order (
     id            BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
     shop_id       BIGINT        NOT NULL CONSTRAINT fk_order_shop REFERENCES shop (id),
     status        VARCHAR(10)   NOT NULL CONSTRAINT ck_order_status CHECK (status IN ('PLACED', 'CANCELLED')),
-    total         NUMERIC(12,2) NOT NULL DEFAULT 0 CONSTRAINT ck_order_total CHECK (total >= 0),
+    -- 14 digits: the largest valid order (50 lines x 1,000 units x 999,999.99) is ~5 x 10^10.
+    total         NUMERIC(14,2) NOT NULL DEFAULT 0 CONSTRAINT ck_order_total CHECK (total >= 0),
     created_by    BIGINT        NOT NULL,
     created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
     cancelled_at  TIMESTAMPTZ,
@@ -370,7 +389,82 @@ CREATE TABLE stock_movement (
 CREATE INDEX ix_movement_product_created ON stock_movement (product_id, created_at DESC);
 ```
 
-- [ ] **Step 8: Create the test base class `src/test/java/dev/wrenz/stockroom/support/IntegrationTest.java`**
+- [ ] **Step 8: Create the database guard and the test base class**
+
+`src/test/java/dev/wrenz/stockroom/support/TestDatabaseGuard.java`:
+
+```java
+package dev.wrenz.stockroom.support;
+
+import org.springframework.boot.flyway.autoconfigure.FlywayMigrationStrategy;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import javax.sql.DataSource;
+
+/**
+ * Tests migrate and TRUNCATE the database. This guard makes sure that database is the disposable
+ * test one, before Flyway runs and before every wipe. A misconfigured TEST_DB_URL fails loudly
+ * instead of destroying real data.
+ */
+@TestConfiguration(proxyBeanMethods = false)
+public class TestDatabaseGuard {
+
+    public static final String EXPECTED_DATABASE = "stockroom_test";
+
+    @Bean
+    FlywayMigrationStrategy guardedMigration(DataSource dataSource) {
+        return flyway -> {
+            requireTestDatabase(new JdbcTemplate(dataSource));
+            flyway.migrate();
+        };
+    }
+
+    public static void requireTestDatabase(JdbcTemplate jdbc) {
+        String database = jdbc.queryForObject("SELECT current_database()", String.class);
+        if (!EXPECTED_DATABASE.equals(database)) {
+            throw new IllegalStateException("Refusing to run destructive tests against database '" + database
+                    + "'. Tests only run against '" + EXPECTED_DATABASE + "'.");
+        }
+    }
+}
+```
+
+`src/test/java/dev/wrenz/stockroom/support/TestDatabaseGuardTest.java`:
+
+```java
+package dev.wrenz.stockroom.support;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+class TestDatabaseGuardTest {
+
+    @Test
+    void refusesAnyOtherDatabase() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        when(jdbc.queryForObject("SELECT current_database()", String.class)).thenReturn("stockroom_dev");
+        assertThatThrownBy(() -> TestDatabaseGuard.requireTestDatabase(jdbc))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("stockroom_dev");
+    }
+
+    @Test
+    void acceptsTheTestDatabase() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        when(jdbc.queryForObject("SELECT current_database()", String.class)).thenReturn("stockroom_test");
+        assertThatCode(() -> TestDatabaseGuard.requireTestDatabase(jdbc)).doesNotThrowAnyException();
+    }
+}
+```
+
+`src/test/java/dev/wrenz/stockroom/support/IntegrationTest.java`:
 
 ```java
 package dev.wrenz.stockroom.support;
@@ -379,6 +473,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -387,6 +482,7 @@ import org.springframework.test.web.servlet.MockMvc;
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+@Import(TestDatabaseGuard.class)
 public abstract class IntegrationTest {
 
     @Autowired
@@ -397,6 +493,7 @@ public abstract class IntegrationTest {
 
     @BeforeEach
     void resetDatabase() {
+        TestDatabaseGuard.requireTestDatabase(jdbc);
         jdbc.execute("TRUNCATE stock_movement, order_item, customer_order, product, app_user, shop RESTART IDENTITY CASCADE");
     }
 }
@@ -497,9 +594,9 @@ class SchemaConstraintsTest extends IntegrationTest {
 
 - [ ] **Step 10: Run the tests**
 
-Run: `./mvnw -B test -Dtest=SchemaConstraintsTest`
+Run: `./mvnw -B test -Dtest='SchemaConstraintsTest,TestDatabaseGuardTest'`
 
-Expected: `Tests run: 7, Failures: 0, Errors: 0`.
+Expected: `Tests run: 9, Failures: 0, Errors: 0`. **Prove the guard works:** run `TEST_DB_URL=jdbc:postgresql://localhost:5432/stockroom_dev ./mvnw -B test -Dtest=SchemaConstraintsTest`. It must fail before touching anything, either with `permission denied` (the test user can't connect) or with the guard's `Refusing to run destructive tests` message.
 
 If the context fails with "Failed to determine a suitable driver class" or "connection refused", PostgreSQL isn't running or `stockroom_test` doesn't exist: redo Task 0 Step 4. The test was written against a schema that is created in this same task, so the first successful run is the proof that the migration and its constraint names are right. To see the test fail once, rename `fk_order_item_product` in the SQL, re-run (`Failures: 1`), then revert it.
 
@@ -1001,7 +1098,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `ConflictException` (Task 2).
 - Produces:
-  - `Shop(String name)`, `getId()`, `getName()`
+  - `Shop(String name)`, `static Shop demo(String name)`, `getId()`, `getName()`, `isDemo()`; `ShopRepository.existsByDemoTrue()`
   - `enum Role { OWNER, STAFF }`
   - `AppUser(long shopId, String email, String passwordHash, Role role)` with getters `getId()`, `getShopId()`, `getEmail()`, `getPasswordHash()`, `getRole()`, `getCreatedAt()`
   - `AppUserRepository`: `Optional<AppUser> findByEmail(String)`, `boolean existsByEmail(String)`, `List<AppUser> findByShopIdOrderById(long)`
@@ -1009,9 +1106,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `ProductRepository`: `Optional<Product> findByIdAndShopId(long id, long shopId)`, `List<Product> findByShopIdAndIdIn(long shopId, Collection<Long> ids)`, `Page<Product> search(long shopId, boolean includeArchived, boolean lowStockOnly, String pattern, Pageable pageable)`
   - `enum MovementReason { OPENING_STOCK, RESTOCK, SALE, CANCEL }`
   - `StockMovementRepository`: `Page<StockMovement> findByShopIdAndProductIdOrderByCreatedAtDescIdDesc(long shopId, long productId, Pageable pageable)`
-  - `StockRepository`:
+  - `StockRepository` (constant `public static final int MAX_STOCK = 1_000_000_000`):
     - `boolean deduct(long shopId, long productId, int quantity, long orderId, long userId)`
-    - `boolean restock(long shopId, long productId, int quantity, String note, long userId)`
+    - `boolean restock(long shopId, long productId, int quantity, String note, long userId)`: false if missing, archived, or it would exceed `MAX_STOCK`
     - `boolean returnStock(long shopId, long productId, int quantity, long orderId, long userId)`
     - `void recordOpeningStock(long shopId, long productId, int quantity, long userId)`
     - All four require an existing transaction (`Propagation.MANDATORY`).
@@ -1142,6 +1239,14 @@ class StockRepositoryTest extends IntegrationTest {
     }
 
     @Test
+    void restockRefusesToExceedTheStockLimit() {
+        jdbc.update("UPDATE product SET stock_qty = ? WHERE id = ?", StockRepository.MAX_STOCK - 10, productId);
+        assertThat(tx.execute(s -> stock.restock(shopId, productId, 11, null, userId))).isFalse();
+        assertThat(tx.execute(s -> stock.restock(shopId, productId, 10, null, userId))).isTrue();
+        assertThat(stockOf(productId)).isEqualTo(StockRepository.MAX_STOCK);
+    }
+
+    @Test
     void returnStockWorksEvenForArchivedProducts() {
         jdbc.update("UPDATE product SET active = false WHERE id = ?", productId);
         assertThat(tx.execute(s -> stock.returnStock(shopId, productId, 2, orderId, userId))).isTrue();
@@ -1216,6 +1321,10 @@ public class Shop {
     @Column(nullable = false)
     private String name;
 
+    /** Only DemoDataSeeder creates demo shops; no request can set this. */
+    @Column(name = "is_demo", nullable = false, updatable = false)
+    private boolean demo;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -1226,8 +1335,15 @@ public class Shop {
         this.createdAt = Instant.now();
     }
 
+    public static Shop demo(String name) {
+        Shop shop = new Shop(name);
+        shop.demo = true;
+        return shop;
+    }
+
     public Long getId() { return id; }
     public String getName() { return name; }
+    public boolean isDemo() { return demo; }
     public Instant getCreatedAt() { return createdAt; }
 }
 ```
@@ -1239,7 +1355,9 @@ package dev.wrenz.stockroom.shop;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 
-public interface ShopRepository extends JpaRepository<Shop, Long> {}
+public interface ShopRepository extends JpaRepository<Shop, Long> {
+    boolean existsByDemoTrue();
+}
 ```
 
 `user/Role.java`:
@@ -1328,12 +1446,19 @@ public interface AppUserRepository extends JpaRepository<AppUser, Long> {
 package dev.wrenz.stockroom.product;
 
 import jakarta.persistence.*;
+import org.hibernate.annotations.DynamicUpdate;
 
 import java.math.BigDecimal;
 import java.time.Instant;
 
+/**
+ * @DynamicUpdate: an UPDATE contains only the columns that actually changed. An edit (sku, name, price,
+ * threshold) therefore can't write back a stale `active`, and an archive can't write back a stale name
+ * or price, even when both loaded the row before the other committed.
+ */
 @Entity
 @Table(name = "product")
+@DynamicUpdate
 public class Product {
 
     @Id
@@ -1556,6 +1681,9 @@ import org.springframework.transaction.annotation.Transactional;
 @Transactional(propagation = Propagation.MANDATORY)
 public class StockRepository {
 
+    /** Far below INTEGER's 2,147,483,647, leaving headroom for stock returned by cancellations. */
+    public static final int MAX_STOCK = 1_000_000_000;
+
     private final JdbcTemplate jdbc;
 
     @PersistenceContext
@@ -1573,12 +1701,12 @@ public class StockRepository {
                 """, quantity, productId, shopId, quantity);
     }
 
-    /** Restock: only active products in this shop. */
+    /** Restock: only active products in this shop, and never above MAX_STOCK. */
     public boolean restock(long shopId, long productId, int quantity, String note, long userId) {
         return apply(shopId, productId, quantity, MovementReason.RESTOCK, null, note, userId, """
                 UPDATE product SET stock_qty = stock_qty + ?, updated_at = now()
-                WHERE id = ? AND shop_id = ? AND active = true
-                """, quantity, productId, shopId);
+                WHERE id = ? AND shop_id = ? AND active = true AND stock_qty <= ? - ?
+                """, quantity, productId, shopId, MAX_STOCK, quantity);
     }
 
     /** Cancellation: reverses a sale, so archived products get their stock back too. */
@@ -1797,7 +1925,7 @@ public interface OrderItemRepository extends JpaRepository<OrderItem, Long> {
 
 Run: `./mvnw -B test -Dtest='CustomerOrderTest,StockRepositoryTest,SchemaConstraintsTest'`
 
-Expected: `Tests run: 17, Failures: 0, Errors: 0`. `ddl-auto: validate` also checks every entity against the Flyway schema when the context starts; a mapping mistake fails the context load with a `SchemaManagementException` that names the column.
+Expected: `Tests run: 18, Failures: 0, Errors: 0`. `ddl-auto: validate` also checks every entity against the Flyway schema when the context starts; a mapping mistake fails the context load with a `SchemaManagementException` that names the column.
 
 - [ ] **Step 9: Commit**
 
@@ -1815,7 +1943,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create in `security/`: `JwtProperties.java`, `JwtConfig.java`, `TokenService.java`, `AuthUser.java`, `SecurityConfig.java`, `ProblemSecurityHandlers.java`, `UserIdRequestAttributeFilter.java`, `Utf8MaxBytes.java`, `Utf8MaxBytesValidator.java`
 - Create in `common/`: `RequestLoggingFilter.java`
-- Create in `user/`: `RegisterRequest.java`, `LoginRequest.java`, `TokenResponse.java`, `CreateUserRequest.java`, `UserResponse.java`, `AuthService.java`, `AuthController.java`, `UserService.java`, `UserController.java`
+- Create in `user/`: `RegisterRequest.java`, `LoginRequest.java`, `TokenResponse.java`, `CreateUserRequest.java`, `UserResponse.java`, `ReservedEmails.java`, `AuthService.java`, `AuthController.java`, `UserService.java`, `UserController.java`
 - Test: `security/JwtConfigTest.java`, `security/Utf8MaxBytesValidatorTest.java`, `support/TestApi.java`, `user/AuthIntegrationTest.java`, `security/TokenCasesTest.java`, `common/HealthEndpointTest.java`
 
 **Interfaces:**
@@ -2017,6 +2145,19 @@ class AuthIntegrationTest extends IntegrationTest {
                 .andExpect(jsonPath("$.length()").value(2))
                 .andExpect(jsonPath("$[1].role").value("STAFF"))
                 .andExpect(jsonPath("$[0].passwordHash").doesNotExist());
+    }
+
+    @Test
+    void theDemoEmailDomainIsReservedForTheSeeder() throws Exception {
+        register("Demo Sari-Sari Store", "owner@demo.stockroom.dev", TestApi.PASSWORD)
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.errors[0].field").value("email"));
+        TestApi.Session owner = api.registerShop("Shop", "owner@shop.test");
+        mvc.perform(post("/api/users").header("Authorization", owner.bearer()).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"staff@DEMO.stockroom.dev\",\"password\":\"password123\"}"))
+                .andExpect(status().isBadRequest());
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM app_user WHERE email LIKE '%@demo.stockroom.dev'", Integer.class)).isZero();
     }
 
     @Test
@@ -2630,6 +2771,29 @@ public record UserResponse(long id, String email, Role role, Instant createdAt) 
 
 - [ ] **Step 9: Implement the services and controllers**
 
+`user/ReservedEmails.java`:
+
+```java
+package dev.wrenz.stockroom.user;
+
+import dev.wrenz.stockroom.common.ValidationException;
+
+/** The demo accounts' domain can only be created by DemoDataSeeder, never through the API. */
+public final class ReservedEmails {
+
+    public static final String DEMO_DOMAIN = "@demo.stockroom.dev";
+
+    private ReservedEmails() {}
+
+    /** email is already trimmed and lowercased by the request record. */
+    public static void requireNotReserved(String email) {
+        if (email.endsWith(DEMO_DOMAIN)) {
+            throw new ValidationException("email", "This email domain is reserved");
+        }
+    }
+}
+```
+
 `user/AuthService.java`:
 
 ```java
@@ -2666,6 +2830,7 @@ public class AuthService {
     /** Shop and owner are created together or not at all. A duplicate email becomes 409 EMAIL_TAKEN. */
     @Transactional
     public TokenResponse register(RegisterRequest request) {
+        ReservedEmails.requireNotReserved(request.email());
         Shop shop = shops.save(new Shop(request.shopName()));
         AppUser owner = users.save(new AppUser(shop.getId(), request.email(), encoder.encode(request.password()), Role.OWNER));
         return tokens.issue(owner);
@@ -2741,6 +2906,7 @@ public class UserService {
 
     @Transactional
     public UserResponse createStaff(AuthUser caller, CreateUserRequest request) {
+        ReservedEmails.requireNotReserved(request.email());
         AppUser staff = users.save(new AppUser(caller.shopId(), request.email(), encoder.encode(request.password()), Role.STAFF));
         return UserResponse.from(staff);
     }
@@ -2795,7 +2961,7 @@ public class UserController {
 
 Run: `./mvnw -B test -Dtest='JwtConfigTest,Utf8MaxBytesValidatorTest,AuthIntegrationTest,TokenCasesTest,HealthEndpointTest'`
 
-Expected: `Tests run: 16, Failures: 0, Errors: 0`. If `missingToken` returns an empty body, check that `exceptionHandling(...)` sets the entry point: the missing-token case comes from `ExceptionTranslationFilter`, not the resource server.
+Expected: `Tests run: 17, Failures: 0, Errors: 0`. If `missingToken` returns an empty body, check that `exceptionHandling(...)` sets the entry point: the missing-token case comes from `ExceptionTranslationFilter`, not the resource server.
 
 - [ ] **Step 11: Run the whole suite, then commit**
 
@@ -2821,7 +2987,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Consumes: `AuthService`, `RateLimitedException`.
 - Produces:
   - `LoginRateLimiter`: `void checkIp(String ip)`, `void checkEmailNotLocked(String email)`, `void recordFailure(String email)`, `void clear()`
-  - `ClientIpResolver.resolve(HttpServletRequest) -> String`
+  - `ClientIpResolver.resolve(HttpServletRequest, boolean trustForwardedFor) -> String`
+  - `RateLimitProperties(int maxAttemptsPerIp, int maxFailuresPerEmail, Duration window, long maxKeys, boolean trustForwardedFor)`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2841,29 +3008,37 @@ class ClientIpResolverTest {
     void withoutAHeaderUsesTheSocketAddress() {
         MockHttpServletRequest request = new MockHttpServletRequest();
         request.setRemoteAddr("192.0.2.10");
-        assertThat(ClientIpResolver.resolve(request)).isEqualTo("192.0.2.10");
+        assertThat(ClientIpResolver.resolve(request, true)).isEqualTo("192.0.2.10");
+    }
+
+    @Test
+    void theHeaderIsIgnoredUnlessWeAreBehindTheTrustedProxy() {
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setRemoteAddr("192.0.2.10");
+        request.addHeader("X-Forwarded-For", "203.0.113.9");
+        assertThat(ClientIpResolver.resolve(request, false)).isEqualTo("192.0.2.10");
     }
 
     @Test
     void usesTheLastEntryBecauseEarlierOnesCanBeForged() {
         MockHttpServletRequest request = new MockHttpServletRequest();
         request.addHeader("X-Forwarded-For", "1.1.1.1, 203.0.113.9");
-        assertThat(ClientIpResolver.resolve(request)).isEqualTo("203.0.113.9");
+        assertThat(ClientIpResolver.resolve(request, true)).isEqualTo("203.0.113.9");
     }
 
     @Test
     void stripsThePortAzureAppends() {
         MockHttpServletRequest ipv4 = new MockHttpServletRequest();
         ipv4.addHeader("X-Forwarded-For", "203.0.113.9:54321");
-        assertThat(ClientIpResolver.resolve(ipv4)).isEqualTo("203.0.113.9");
+        assertThat(ClientIpResolver.resolve(ipv4, true)).isEqualTo("203.0.113.9");
 
         MockHttpServletRequest ipv6 = new MockHttpServletRequest();
         ipv6.addHeader("X-Forwarded-For", "[2001:db8::1]:443");
-        assertThat(ClientIpResolver.resolve(ipv6)).isEqualTo("2001:db8::1");
+        assertThat(ClientIpResolver.resolve(ipv6, true)).isEqualTo("2001:db8::1");
 
         MockHttpServletRequest bareIpv6 = new MockHttpServletRequest();
         bareIpv6.addHeader("X-Forwarded-For", "2001:db8::1");
-        assertThat(ClientIpResolver.resolve(bareIpv6)).isEqualTo("2001:db8::1");
+        assertThat(ClientIpResolver.resolve(bareIpv6, true)).isEqualTo("2001:db8::1");
     }
 }
 ```
@@ -2877,12 +3052,15 @@ import dev.wrenz.stockroom.support.IntegrationTest;
 import dev.wrenz.stockroom.support.TestApi;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.ResultActions;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+/** Simulates production, where the app sits behind Azure's front end (the trusted proxy). */
+@TestPropertySource(properties = "stockroom.rate-limit.trust-forwarded-for=true")
 class RateLimitTest extends IntegrationTest {
 
     @Test
@@ -2944,8 +3122,13 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
 
+/**
+ * trustForwardedFor must be true ONLY when every request arrives through a proxy that appends the
+ * client address (Azure App Service's front end). Otherwise any caller could pick their own "IP".
+ */
 @ConfigurationProperties("stockroom.rate-limit")
-public record RateLimitProperties(int maxAttemptsPerIp, int maxFailuresPerEmail, Duration window, long maxKeys) {}
+public record RateLimitProperties(int maxAttemptsPerIp, int maxFailuresPerEmail, Duration window, long maxKeys,
+                                  boolean trustForwardedFor) {}
 ```
 
 `security/ClientIpResolver.java`:
@@ -2956,15 +3139,16 @@ package dev.wrenz.stockroom.security;
 import jakarta.servlet.http.HttpServletRequest;
 
 /**
- * Azure's front end APPENDS the real client address to X-Forwarded-For, sometimes with a port.
- * Anything before it came from the client and can be forged, so we only trust the LAST entry.
+ * Behind Azure's front end (trustForwardedFor = true), the real client address is APPENDED to
+ * X-Forwarded-For, sometimes with a port. Anything before it came from the client and can be forged,
+ * so only the LAST entry is trusted. Without the trusted proxy, the header is ignored entirely.
  */
 public final class ClientIpResolver {
 
     private ClientIpResolver() {}
 
-    public static String resolve(HttpServletRequest request) {
-        String header = request.getHeader("X-Forwarded-For");
+    public static String resolve(HttpServletRequest request, boolean trustForwardedFor) {
+        String header = trustForwardedFor ? request.getHeader("X-Forwarded-For") : null;
         if (header == null || header.isBlank()) {
             return request.getRemoteAddr();
         }
@@ -3050,6 +3234,7 @@ Replace the two public methods of `AuthService`. Add a `LoginRateLimiter limiter
     @Transactional
     public TokenResponse register(RegisterRequest request, String clientIp) {
         limiter.checkIp(clientIp);
+        ReservedEmails.requireNotReserved(request.email());
         Shop shop = shops.save(new Shop(request.shopName()));
         AppUser owner = users.save(new AppUser(shop.getId(), request.email(), encoder.encode(request.password()), Role.OWNER));
         return tokens.issue(owner);
@@ -3085,26 +3270,50 @@ The new constructor is:
 
 Add the field `private final LoginRateLimiter limiter;` and the import `dev.wrenz.stockroom.security.LoginRateLimiter`.
 
-Replace the two methods in `AuthController`, adding the imports `jakarta.servlet.http.HttpServletRequest` and `dev.wrenz.stockroom.security.ClientIpResolver`:
+Replace `AuthController` entirely:
 
 ```java
+package dev.wrenz.stockroom.user;
+
+import dev.wrenz.stockroom.security.ClientIpResolver;
+import dev.wrenz.stockroom.security.RateLimitProperties;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+
+    private final AuthService auth;
+    private final boolean trustForwardedFor;
+
+    public AuthController(AuthService auth, RateLimitProperties limits) {
+        this.auth = auth;
+        this.trustForwardedFor = limits.trustForwardedFor();
+    }
+
     @PostMapping("/register")
     @ResponseStatus(HttpStatus.CREATED)
     public TokenResponse register(@Valid @RequestBody RegisterRequest request, HttpServletRequest http) {
-        return auth.register(request, ClientIpResolver.resolve(http));
+        return auth.register(request, ClientIpResolver.resolve(http, trustForwardedFor));
     }
 
     @PostMapping("/login")
     public TokenResponse login(@Valid @RequestBody LoginRequest request, HttpServletRequest http) {
-        return auth.login(request, ClientIpResolver.resolve(http));
+        return auth.login(request, ClientIpResolver.resolve(http, trustForwardedFor));
     }
+}
 ```
+
+In `src/main/resources/application.yml`, add `trust-forwarded-for: false` as the last line under `stockroom.rate-limit`. Production turns it on in Task 13.
 
 In `IntegrationTest`, add `@Autowired protected LoginRateLimiter rateLimiter;` (import `dev.wrenz.stockroom.security.LoginRateLimiter`). In `resetDatabase()`, add `rateLimiter.clear();` after the TRUNCATE.
 
 - [ ] **Step 5: Run the tests, then the full suite**
 
-Run: `./mvnw -B test -Dtest='ClientIpResolverTest,RateLimitTest'`. Expected: `Tests run: 6, Failures: 0`.
+Run: `./mvnw -B test -Dtest='ClientIpResolverTest,RateLimitTest'`. Expected: `Tests run: 7, Failures: 0`.
 
 Run: `./mvnw -B test`. Expected: 0 failures.
 
@@ -3124,6 +3333,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create in `product/`: `ProductRequest.java`, `ProductUpdateRequest.java`, `ProductResponse.java`, `RestockRequest.java`, `ProductService.java`, `ProductController.java`
 - Create in `stock/`: `MovementResponse.java`
+- Create in `common/`: `JacksonConfig.java` (rejects decimals for whole-number fields)
 - Modify: `support/TestApi.java` (add product helpers)
 - Test: `product/ProductIntegrationTest.java`
 
@@ -3220,8 +3430,33 @@ class ProductIntegrationTest extends IntegrationTest {
                 .andExpect(jsonPath("$.code").value("VALIDATION_FAILED")).andExpect(jsonPath("$.errors[0].field").value("price"));
         create(owner, "{\"sku\":\"B\",\"name\":\"B\",\"price\":-1}").andExpect(status().isBadRequest());
         create(owner, "{\"sku\":\"C\",\"name\":\"C\",\"price\":1e15}").andExpect(status().isBadRequest());
+        create(owner, "{\"sku\":\"E\",\"name\":\"E\",\"price\":1000000.00}").andExpect(status().isBadRequest());
+        create(owner, "{\"sku\":\"F\",\"name\":\"F\",\"price\":999999.99}").andExpect(status().isCreated());
+        jdbc.update("DELETE FROM stock_movement"); jdbc.update("DELETE FROM product");
         create(owner, "{\"sku\":\"D\",\"name\":\"   \",\"price\":1.00}").andExpect(status().isBadRequest());
         assertThat(jdbc.queryForObject("SELECT count(*) FROM product", Integer.class)).isZero();
+    }
+
+    @Test
+    void fractionalWholeNumbersAre400NotTruncated() throws Exception {
+        create(owner, "{\"sku\":\"A\",\"name\":\"A\",\"price\":1.00,\"initialStock\":1.5}")
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+        create(owner, "{\"sku\":\"B\",\"name\":\"B\",\"price\":1.00,\"lowStockThreshold\":2.5}")
+                .andExpect(status().isBadRequest());
+        long id = api.createProduct(owner, "C", "1.00", 5);
+        mvc.perform(post("/api/products/" + id + "/restock").header("Authorization", owner.bearer())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"quantity\":1.5}"))
+                .andExpect(status().isBadRequest());
+        assertThat(api.stockOf(owner, id)).isEqualTo(5);
+    }
+
+    @Test
+    void restockBeyondTheStockLimitIs409() throws Exception {
+        long id = api.createProduct(owner, "BIG", "1.00", 0);
+        jdbc.update("UPDATE product SET stock_qty = ? WHERE id = ?", dev.wrenz.stockroom.stock.StockRepository.MAX_STOCK, id);
+        mvc.perform(post("/api/products/" + id + "/restock").header("Authorization", owner.bearer())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"quantity\":1}"))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("STOCK_LIMIT_EXCEEDED"));
     }
 
     @Test
@@ -3349,7 +3584,7 @@ import java.math.BigDecimal;
 public record ProductRequest(
         @NotBlank @Size(max = 64) String sku,
         @NotBlank @Size(max = 200) String name,
-        @NotNull @DecimalMin("0.00") @Digits(integer = 10, fraction = 2) BigDecimal price,
+        @NotNull @DecimalMin("0.00") @Digits(integer = 6, fraction = 2) BigDecimal price,
         @Min(0) Integer lowStockThreshold,
         @Min(0) @Max(1_000_000) Integer initialStock) {
 
@@ -3376,7 +3611,7 @@ import java.math.BigDecimal;
 public record ProductUpdateRequest(
         @NotBlank @Size(max = 64) String sku,
         @NotBlank @Size(max = 200) String name,
-        @NotNull @DecimalMin("0.00") @Digits(integer = 10, fraction = 2) BigDecimal price,
+        @NotNull @DecimalMin("0.00") @Digits(integer = 6, fraction = 2) BigDecimal price,
         @NotNull @Min(0) Integer lowStockThreshold) {
 
     public ProductUpdateRequest {
@@ -3434,11 +3669,38 @@ public record MovementResponse(long id, int change, MovementReason reason, Long 
 }
 ```
 
-- [ ] **Step 5: Implement `ProductService.java`**
+- [ ] **Step 5: Reject decimals for whole-number JSON fields: `common/JacksonConfig.java`**
+
+By default, Jackson 3 turns `1.9` into `1` for an `Integer` field. This was verified against Boot 4.1.1 on 2026-09-28: `{"productId":2.7,"quantity":1.9}` became product 2, quantity 1. This makes it a 400 instead:
+
+```java
+package dev.wrenz.stockroom.common;
+
+import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import tools.jackson.databind.cfg.CoercionAction;
+import tools.jackson.databind.cfg.CoercionInputShape;
+import tools.jackson.databind.type.LogicalType;
+
+@Configuration(proxyBeanMethods = false)
+public class JacksonConfig {
+
+    /** Quantities and IDs must be whole numbers: fail on 1.5 (and 1.0) instead of silently truncating. */
+    @Bean
+    JsonMapperBuilderCustomizer rejectDecimalsForWholeNumbers() {
+        return builder -> builder.withCoercionConfig(LogicalType.Integer,
+                config -> config.setCoercion(CoercionInputShape.Float, CoercionAction.Fail));
+    }
+}
+```
+
+- [ ] **Step 6: Implement `ProductService.java`**
 
 ```java
 package dev.wrenz.stockroom.product;
 
+import dev.wrenz.stockroom.common.ConflictException;
 import dev.wrenz.stockroom.common.NotFoundException;
 import dev.wrenz.stockroom.common.PageResponse;
 import dev.wrenz.stockroom.security.AuthUser;
@@ -3505,10 +3767,16 @@ public class ProductService {
         products.saveAndFlush(product);
     }
 
+    /** The guarded UPDATE matched nothing: missing/archived is 404; otherwise the stock limit was hit (409). */
     @Transactional
     public ProductResponse restock(AuthUser caller, long id, RestockRequest request) {
         if (!stock.restock(caller.shopId(), id, request.quantity(), request.note(), caller.userId())) {
-            throw new NotFoundException("Product", id);
+            Product product = find(caller, id);
+            if (!product.isActive()) {
+                throw new NotFoundException("Product", id);
+            }
+            throw new ConflictException("STOCK_LIMIT_EXCEEDED",
+                    "Restocking would take product " + id + " above " + StockRepository.MAX_STOCK + " units");
         }
         return ProductResponse.from(find(caller, id));
     }
@@ -3533,7 +3801,7 @@ public class ProductService {
 }
 ```
 
-- [ ] **Step 6: Implement `ProductController.java`**
+- [ ] **Step 7: Implement `ProductController.java`**
 
 ```java
 package dev.wrenz.stockroom.product;
@@ -3611,13 +3879,13 @@ public class ProductController {
 }
 ```
 
-- [ ] **Step 7: Run the test**
+- [ ] **Step 8: Run the test**
 
 Run: `./mvnw -B test -Dtest=ProductIntegrationTest`
 
-Expected: `Tests run: 14, Failures: 0, Errors: 0`. If `invalidPricesAre400` gets 500 for `1e15`, `@Digits(integer = 10)` isn't being applied: check that the import is `jakarta.validation.constraints.Digits`.
+Expected: `Tests run: 16, Failures: 0, Errors: 0`. If `invalidPricesAre400` gets 500 for `1e15`, `@Digits(integer = 6)` isn't being applied: check that the import is `jakarta.validation.constraints.Digits`.
 
-- [ ] **Step 8: Full suite, then commit**
+- [ ] **Step 9: Full suite, then commit**
 
 Run: `./mvnw -B test`. Expected: 0 failures.
 
@@ -3773,6 +4041,29 @@ class OrderIntegrationTest extends IntegrationTest {
         order(owner, "{\"items\":[{\"productId\":%d,\"quantity\":\"two\"}]}".formatted(noodles))
                 .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
         order(owner, "{\"items\":[").andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+        order(owner, "{\"items\":[{\"productId\":%d,\"quantity\":1.9}]}".formatted(noodles)).andExpect(status().isBadRequest());
+        order(owner, "{\"items\":[{\"productId\":%d.7,\"quantity\":1}]}".formatted(noodles)).andExpect(status().isBadRequest());
+        assertThat(count("SELECT count(*) FROM customer_order")).isZero();
+        assertThat(api.stockOf(owner, noodles)).isEqualTo(10);
+    }
+
+    @Test
+    void nullItemIs400WithNoWrites() throws Exception {
+        order(owner, "{\"items\":[null]}")
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+        assertThat(count("SELECT count(*) FROM customer_order")).isZero();
+    }
+
+    @Test
+    void theLargestAllowedOrderTotalFits() throws Exception {
+        StringBuilder items = new StringBuilder();
+        for (int i = 0; i < 11; i++) {
+            long id = api.createProduct(owner, "LUX-" + i, "999999.99", 1000);
+            items.append(i == 0 ? "" : ",").append("{\"productId\":%d,\"quantity\":1000}".formatted(id));
+        }
+        order(owner, "{\"items\":[" + items + "]}")
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.total").value(10_999_999_890.00));
     }
 
     @Test
@@ -3874,7 +4165,8 @@ import jakarta.validation.constraints.Size;
 
 import java.util.List;
 
-public record PlaceOrderRequest(@NotNull @Size(min = 1, max = 50) List<@Valid OrderLineRequest> items) {}
+/** @NotNull on the element too: {"items":[null]} must be a 400, not a NullPointerException. */
+public record PlaceOrderRequest(@NotNull @Size(min = 1, max = 50) List<@NotNull @Valid OrderLineRequest> items) {}
 ```
 
 `order/OrderLineResponse.java`:
@@ -4140,7 +4432,7 @@ public class OrderController {
 
 Run: `./mvnw -B test -Dtest='OrderRulesTest,OrderIntegrationTest'`
 
-Expected: `Tests run: 13, Failures: 0, Errors: 0`. If `listIsNewestFirst` is flaky, both orders got the same `created_at`, and the `id DESC` tie-breaker in `findByShopIdOrderByCreatedAtDescIdDesc` should have resolved it: check that the method name has both parts.
+Expected: `Tests run: 15, Failures: 0, Errors: 0`. If `listIsNewestFirst` is flaky, both orders got the same `created_at`, and the `id DESC` tie-breaker in `findByShopIdOrderByCreatedAtDescIdDesc` should have resolved it: check that the method name has both parts.
 
 - [ ] **Step 9: Full suite, then commit**
 
@@ -4163,7 +4455,7 @@ These tests are the evidence for the core promise in spec section 1. They run on
 - Test: `src/test/java/dev/wrenz/stockroom/concurrency/ConcurrencyTest.java`
 
 **Interfaces:**
-- Consumes: `OrderService.place/cancel`, `ProductService.archive`, `ProductRepository`, `AuthUser`, `Role`, `TestApi`.
+- Consumes: `OrderService.place/cancel`, `ProductService.archive/update/restock`, `ProductUpdateRequest`, `ProductRepository`, `AuthUser`, `Role`, `TestApi`.
 
 - [ ] **Step 1: Write the test**
 
@@ -4213,9 +4505,12 @@ class ConcurrencyTest extends IntegrationTest {
         pool = Executors.newFixedThreadPool(20);
     }
 
+    /** Make sure no worker transaction outlives this test and overlaps the next test's TRUNCATE. */
     @AfterEach
-    void stopPool() {
+    void stopPool() throws InterruptedException {
         pool.shutdownNow();
+        assertThat(pool.awaitTermination(45, TimeUnit.SECONDS))
+                .as("worker threads still running; the next test's cleanup would race them").isTrue();
     }
 
     @Test
@@ -4250,21 +4545,94 @@ class ConcurrencyTest extends IntegrationTest {
     void oppositeLineOrderAndCancellationsDoNotDeadlock() throws Exception {
         long a = api.createProduct(session, "A", "1.00", 10_000);
         long b = api.createProduct(session, "B", "1.00", 10_000);
-        Callable<Void> ab = () -> { for (int i = 0; i < 100; i++) orders.place(owner, order(line(a, 1), line(b, 1))); return null; };
-        Callable<Void> ba = () -> { for (int i = 0; i < 100; i++) orders.place(owner, order(line(b, 1), line(a, 1))); return null; };
-        Callable<Void> canceller = () -> {
-            for (int i = 0; i < 100; i++) {
-                List<Long> placed = jdbc.queryForList("SELECT id FROM customer_order WHERE status = 'PLACED' ORDER BY id LIMIT 1", Long.class);
-                if (!placed.isEmpty()) {
-                    try { orders.cancel(owner, placed.get(0)); } catch (ConflictException alreadyCancelled) { /* fine */ }
-                }
-            }
-            return null;
-        };
-        for (Future<Void> f : pool.invokeAll(List.of(ab, ba, canceller), 180, TimeUnit.SECONDS)) {
-            f.get();   // rethrows any deadlock (it would surface as a ConcurrencyFailureException)
+        // Orders to cancel exist BEFORE the race starts, so the canceller always has real work to overlap.
+        List<Long> toCancel = new ArrayList<>();
+        for (int i = 0; i < 50; i++) toCancel.add(orders.place(owner, order(line(a, 1), line(b, 1))).id());
+
+        CountDownLatch start = new CountDownLatch(1);
+        Callable<Void> ab = () -> { start.await(); for (int i = 0; i < 100; i++) orders.place(owner, order(line(a, 1), line(b, 1))); return null; };
+        Callable<Void> ba = () -> { start.await(); for (int i = 0; i < 100; i++) orders.place(owner, order(line(b, 1), line(a, 1))); return null; };
+        Callable<Void> canceller = () -> { start.await(); for (long id : toCancel) orders.cancel(owner, id); return null; };
+        List<Future<Void>> futures = List.of(pool.submit(ab), pool.submit(ba), pool.submit(canceller));
+        start.countDown();
+        for (Future<Void> f : futures) {
+            f.get(120, TimeUnit.SECONDS);   // rethrows any deadlock (surfacing as a ConcurrencyFailureException)
         }
+
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM customer_order WHERE status = 'CANCELLED'", Integer.class)).isEqualTo(50);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM customer_order WHERE status = 'PLACED'", Integer.class)).isEqualTo(200);
+        assertThat(stockOf(a)).isEqualTo(10_000 - 200);
+        assertThat(stockOf(b)).isEqualTo(10_000 - 200);
         assertLedgerBalanced();
+    }
+
+    @Test
+    void twoSimultaneousCancelsReturnStockExactlyOnce() throws Exception {
+        long pid = api.createProduct(session, "CANCEL-ME", "1.00", 10);
+        for (int round = 0; round < 10; round++) {
+            long orderId = orders.place(owner, order(line(pid, 3))).id();
+            CountDownLatch start = new CountDownLatch(1);
+            Callable<String> cancel = () -> {
+                start.await();
+                try {
+                    orders.cancel(owner, orderId);
+                    return "CANCELLED";
+                } catch (ConflictException alreadyCancelled) {
+                    return "CONFLICT";
+                }
+            };
+            Future<String> first = pool.submit(cancel);
+            Future<String> second = pool.submit(cancel);
+            start.countDown();
+            assertThat(List.of(first.get(30, TimeUnit.SECONDS), second.get(30, TimeUnit.SECONDS)))
+                    .containsExactlyInAnyOrder("CANCELLED", "CONFLICT");
+            assertThat(stockOf(pid)).isEqualTo(10);
+        }
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM stock_movement WHERE reason = 'CANCEL'", Integer.class)).isEqualTo(10);
+        assertLedgerBalanced();
+    }
+
+    /** Spec section 5 plus @DynamicUpdate: an edit that loaded the row before an archive must not un-archive it. */
+    @Test
+    void editRacingAnArchiveKeepsTheProductArchived() throws Exception {
+        long pid = api.createProduct(session, "EDIT-VS-ARCHIVE", "10.00", 5);
+        CountDownLatch loaded = new CountDownLatch(1);
+        CountDownLatch archived = new CountDownLatch(1);
+        Future<?> edit = pool.submit(() -> tx.executeWithoutResult(status -> {
+            Product p = products.findByIdAndShopId(pid, session.shopId()).orElseThrow();   // sees active = true
+            loaded.countDown();
+            await(archived);
+            p.update(p.getSku(), "Edited after archive", p.getPrice(), p.getLowStockThreshold());
+        }));
+        assertThat(loaded.await(10, TimeUnit.SECONDS)).isTrue();
+        productService.archive(owner, pid);
+        archived.countDown();
+        edit.get(30, TimeUnit.SECONDS);
+
+        assertThat(jdbc.queryForObject("SELECT active FROM product WHERE id = ?", Boolean.class, pid)).isFalse();
+        assertThat(jdbc.queryForObject("SELECT name FROM product WHERE id = ?", String.class, pid)).isEqualTo("Edited after archive");
+    }
+
+    @Test
+    void archiveRacingAnEditKeepsTheNewName() throws Exception {
+        long pid = api.createProduct(session, "ARCHIVE-VS-EDIT", "10.00", 5);
+        CountDownLatch loaded = new CountDownLatch(1);
+        CountDownLatch edited = new CountDownLatch(1);
+        Future<?> archive = pool.submit(() -> tx.executeWithoutResult(status -> {
+            Product p = products.findByIdAndShopId(pid, session.shopId()).orElseThrow();   // sees the old name
+            loaded.countDown();
+            await(edited);
+            p.archive();
+        }));
+        assertThat(loaded.await(10, TimeUnit.SECONDS)).isTrue();
+        productService.update(owner, pid, new dev.wrenz.stockroom.product.ProductUpdateRequest(
+                "ARCHIVE-VS-EDIT", "New name", new java.math.BigDecimal("12.00"), 5));
+        edited.countDown();
+        archive.get(30, TimeUnit.SECONDS);
+
+        assertThat(jdbc.queryForObject("SELECT active FROM product WHERE id = ?", Boolean.class, pid)).isFalse();
+        assertThat(jdbc.queryForObject("SELECT name FROM product WHERE id = ?", String.class, pid)).isEqualTo("New name");
+        assertThat(jdbc.queryForObject("SELECT price FROM product WHERE id = ?", java.math.BigDecimal.class, pid)).isEqualByComparingTo("12.00");
     }
 
     @Test
@@ -4366,11 +4734,13 @@ class ConcurrencyTest extends IntegrationTest {
 
 Run: `./mvnw -B test -Dtest=ConcurrencyTest`
 
-Expected: `Tests run: 5, Failures: 0, Errors: 0`. These tests pass on first run because the behavior they check was built in Tasks 3 and 7. **Prove they can fail** by breaking the protection on purpose, one at a time, and reverting each:
+Expected: `Tests run: 8, Failures: 0, Errors: 0`. These tests pass on first run because the behavior they check was built in Tasks 3 and 7. **Prove they can fail** by breaking each protection on purpose, one at a time, and reverting each:
 - In `StockRepository.deduct`, delete `AND stock_qty >= ?` (and its last argument). `twentyBuyersForFiveUnitsSellExactlyFive` must fail. It fails either with `ck_product_stock_nonneg` (the database backstop) or with a wrong count.
 - In `Product`, change `updatable = false` to `true` on `stockQty`. `productEditRacingAnOrderKeepsTheSale` must fail with stock 5 instead of 3.
+- In `Product`, remove `@DynamicUpdate`. `editRacingAnArchiveKeepsTheProductArchived` must fail (active comes back `true`), and `archiveRacingAnEditKeepsTheNewName` must fail (the old name comes back).
+- In `CustomerOrderRepository.findForUpdate`, remove `@Lock(LockModeType.PESSIMISTIC_WRITE)`. `twoSimultaneousCancelsReturnStockExactlyOnce` should fail with stock returned twice. It's a race, so run it up to 3 times; a single pass without the lock doesn't disprove it.
 
-Revert both before committing, and re-run: 5/5 pass.
+Revert all of them before committing, and re-run: 8/8 pass.
 
 - [ ] **Step 3: Commit**
 
@@ -4435,18 +4805,49 @@ class CrossShopIsolationTest extends IntegrationTest {
         assertThat(shopAState()).isEqualTo(shopABefore);
     }
 
+    // One test per operation, so a leak in any single path fails its own test (and @AfterEach
+    // reports any change to shop A) instead of being hidden behind an earlier assertion.
+
     @Test
-    void ownerOfShopBGets404OnEverything() throws Exception {
+    void ownerBCannotReadAProduct() throws Exception {
         notFound(get("/api/products/" + productA), ownerB);
+    }
+
+    @Test
+    void ownerBCannotEditAProduct() throws Exception {
         notFound(put("/api/products/" + productA).contentType(MediaType.APPLICATION_JSON)
                 .content("{\"sku\":\"HACK\",\"name\":\"Hacked\",\"price\":0.00,\"lowStockThreshold\":0}"), ownerB);
+    }
+
+    @Test
+    void ownerBCannotArchiveAProduct() throws Exception {
         notFound(delete("/api/products/" + productA), ownerB);
+    }
+
+    @Test
+    void ownerBCannotRestockAProduct() throws Exception {
         notFound(post("/api/products/" + productA + "/restock").contentType(MediaType.APPLICATION_JSON)
                 .content("{\"quantity\":100}"), ownerB);
+    }
+
+    @Test
+    void ownerBCannotReadStockHistory() throws Exception {
         notFound(get("/api/products/" + productA + "/movements"), ownerB);
+    }
+
+    @Test
+    void ownerBCannotOrderAnotherShopsProduct() throws Exception {
         notFound(post("/api/orders").contentType(MediaType.APPLICATION_JSON)
                 .content("{\"items\":[{\"productId\":%d,\"quantity\":1}]}".formatted(productA)), ownerB);
+    }
+
+    @Test
+    void ownerBCannotReadAnOrder() throws Exception {
         notFound(get("/api/orders/" + orderA), ownerB);
+    }
+
+    @Test
+    void ownerBCannotCancelAnOrder() throws Exception {
         notFound(post("/api/orders/" + orderA + "/cancel"), ownerB);
     }
 
@@ -4501,7 +4902,13 @@ class CrossShopIsolationTest extends IntegrationTest {
 
 Run: `./mvnw -B test -Dtest=CrossShopIsolationTest`
 
-Expected: `Tests run: 3, Failures: 0, Errors: 0`. **Prove it can fail:** in `ProductService.find`, temporarily replace `products.findByIdAndShopId(id, caller.shopId())` with `products.findById(id)`. `ownerOfShopBGets404OnEverything` must fail, and the `@AfterEach` check must report a changed shop A. Revert and re-run.
+Expected: `Tests run: 10, Failures: 0, Errors: 0`. **Prove each kind of check can fail**, one break at a time, reverting each:
+- **Read path:** in `ProductService.find`, replace `products.findByIdAndShopId(id, caller.shopId())` with `products.findById(id)`. `ownerBCannotReadAProduct` must fail (200 instead of 404).
+- **Write path:** in `StockRepository.restock`, remove `AND shop_id = ?` from the SQL (and the matching `shopId` argument). The UPDATE now really does change shop A's stock: `ProductService.restock` calls `find` only after a failed update, so this break reaches the write. `ownerBCannotRestockAProduct` must fail with **500 instead of 404**. The stock movement row (shop B, product A) is rejected by the composite foreign key, the transaction rolls back, and `@AfterEach` confirms shop A is unchanged. That's two layers: the application filter failed, and the database backstop from Task 1 caught it.
+- **Order path:** in `StockRepository.deduct`, remove `AND shop_id = ?`. `ownerBCannotOrderAnotherShopsProduct` must fail the same way (500 from the foreign key, shop A unchanged).
+- **Without the backstop:** to watch a leak actually change shop A, also drop `fk_movement_product` in the test database (`ALTER TABLE stock_movement DROP CONSTRAINT fk_movement_product`) together with the restock break. Now `@AfterEach` reports shop A's stock changed. Afterwards, recreate the test database (as the `postgres` user: `DROP DATABASE stockroom_test;`, then the `CREATE DATABASE … OWNER stockroom_test`, `REVOKE` and `GRANT` lines from Task 0 Step 4). The next test run migrates it fresh.
+
+Revert all of them and re-run: 10/10 pass.
 
 - [ ] **Step 3: Commit**
 
@@ -4522,7 +4929,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: the repositories, `StockRepository`, `PasswordEncoder`.
-- Produces: `DemoDataSeeder` (`@Profile("demo")`) with public constants `SHOP_NAME`, `OWNER_EMAIL`, `OWNER_PASSWORD`, `STAFF_EMAIL`, `STAFF_PASSWORD`.
+- Produces: `DemoDataSeeder` (`@Profile("demo")`) with public constants `SHOP_NAME`, `OWNER_EMAIL`, `OWNER_PASSWORD`, `STAFF_EMAIL`, `STAFF_PASSWORD`. The demo shop is identified **only** by `shop.is_demo = true`, which no API can set. The emails use the `@demo.stockroom.dev` domain, which `ReservedEmails` blocks from sign-up (Task 4).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4560,10 +4967,13 @@ class OpenApiTest extends IntegrationTest {
 ```java
 package dev.wrenz.stockroom.demo;
 
+import dev.wrenz.stockroom.support.TestDatabaseGuard;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
@@ -4576,6 +4986,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest
 @ActiveProfiles({"test", "demo"})
+@Import(TestDatabaseGuard.class)
 class DemoDataSeederTest {
 
     @Autowired DemoDataSeeder seeder;
@@ -4584,7 +4995,14 @@ class DemoDataSeederTest {
 
     @BeforeEach
     void clean() {
+        TestDatabaseGuard.requireTestDatabase(jdbc);
         jdbc.execute("TRUNCATE stock_movement, order_item, customer_order, product, app_user, shop RESTART IDENTITY CASCADE");
+    }
+
+    /** Leave nothing behind: a stray demo-domain user would make the next demo-profile startup fail closed. */
+    @AfterEach
+    void cleanUp() {
+        clean();
     }
 
     @Test
@@ -4613,10 +5031,11 @@ class DemoDataSeederTest {
     }
 
     @Test
-    void resetScriptDeletesOnlyTheDemoShopAndRefusesWhenItIsMissing() throws Exception {
+    void resetDeletesOnlyTheFlaggedDemoShopEvenIfAnotherHasTheSameName() throws Exception {
         seeder.run(null);
-        long other = jdbc.queryForObject("INSERT INTO shop (name) VALUES ('Real customer') RETURNING id", Long.class);
-        jdbc.update("INSERT INTO app_user (shop_id, email, password_hash, role) VALUES (?, 'real@shop.test', 'x', 'OWNER')", other);
+        // A real customer who happens to use the same shop name must never be touched.
+        long sameName = jdbc.queryForObject("INSERT INTO shop (name) VALUES (?) RETURNING id", Long.class, DemoDataSeeder.SHOP_NAME);
+        jdbc.update("INSERT INTO app_user (shop_id, email, password_hash, role) VALUES (?, 'real@shop.test', 'x', 'OWNER')", sameName);
         String script = Files.readString(Path.of("ops/reset-demo.sql"));
 
         jdbc.execute(script);
@@ -4628,12 +5047,15 @@ class DemoDataSeederTest {
     }
 
     @Test
-    void resetRefusesIfTheDemoEmailBelongsToADifferentlyNamedShop() throws Exception {
-        long impostor = jdbc.queryForObject("INSERT INTO shop (name) VALUES ('Someone else') RETURNING id", Long.class);
+    void seederFailsClosedIfADemoEmailIsHeldByANonDemoShop() {
+        long impostor = jdbc.queryForObject("INSERT INTO shop (name) VALUES (?) RETURNING id", Long.class, DemoDataSeeder.SHOP_NAME);
         jdbc.update("INSERT INTO app_user (shop_id, email, password_hash, role) VALUES (?, ?, 'x', 'OWNER')", impostor, DemoDataSeeder.OWNER_EMAIL);
-        assertThatThrownBy(() -> jdbc.execute(Files.readString(Path.of("ops/reset-demo.sql"))))
-                .hasMessageContaining("Demo shop not found");
-        assertThat(count("SELECT count(*) FROM shop")).isEqualTo(1);
+
+        assertThatThrownBy(() -> seeder.run(null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(DemoDataSeeder.OWNER_EMAIL);
+        assertThat(count("SELECT count(*) FROM shop WHERE is_demo")).isZero();
+        assertThat(count("SELECT count(*) FROM product")).isZero();
     }
 
     private int count(String sql) {
@@ -4696,8 +5118,8 @@ import java.math.BigDecimal;
 import java.util.List;
 
 /**
- * Seeds the public demo shop ONCE (spec section 8). If the demo owner already exists it does nothing:
- * no reset, no password change, so a redeploy never disrupts someone using the demo.
+ * Seeds the public demo shop ONCE (spec section 8). If a shop flagged is_demo already exists it does
+ * nothing: no reset, no password change, so a redeploy never disrupts someone using the demo.
  * To start over, run ops/reset-demo.sql by hand, then restart the app.
  */
 @Component
@@ -4749,11 +5171,18 @@ public class DemoDataSeeder implements ApplicationRunner {
     @Override
     @Transactional
     public void run(ApplicationArguments args) {
-        if (users.existsByEmail(OWNER_EMAIL)) {
+        if (shops.existsByDemoTrue()) {
             log.info("Demo data already present; leaving it untouched");
             return;
         }
-        Shop shop = shops.save(new Shop(SHOP_NAME));
+        // Fail closed: if a demo email exists without a demo shop, something is wrong. Stop the app
+        // rather than hand the demo logins to whoever holds that account.
+        for (String email : List.of(OWNER_EMAIL, STAFF_EMAIL)) {
+            if (users.existsByEmail(email)) {
+                throw new IllegalStateException("Demo email " + email + " belongs to a non-demo account; refusing to seed");
+            }
+        }
+        Shop shop = shops.save(Shop.demo(SHOP_NAME));
         AppUser owner = users.save(new AppUser(shop.getId(), OWNER_EMAIL, encoder.encode(OWNER_PASSWORD), Role.OWNER));
         users.save(new AppUser(shop.getId(), STAFF_EMAIL, encoder.encode(STAFF_PASSWORD), Role.STAFF));
         for (Item item : ITEMS) {
@@ -4771,20 +5200,16 @@ public class DemoDataSeeder implements ApplicationRunner {
 ```sql
 -- Manually resets the public demo shop. NEVER run by CI.
 -- Usage (Azure): psql "<connection string for stockroom_app>" -f ops/reset-demo.sql, then restart the app to re-seed.
--- Deletes ONLY rows of the shop whose owner is owner@demo.stockroom.dev AND whose name is exactly
--- 'Demo Sari-Sari Store'. Anything else raises an error and deletes nothing.
+-- Deletes ONLY the shop flagged is_demo = true (only DemoDataSeeder can set that flag; no API can).
+-- Names and emails are NOT trusted: a customer can pick any shop name. No flagged shop = error, nothing deleted.
 DO $$
 DECLARE
     demo_shop_id BIGINT;
 BEGIN
-    SELECT s.id INTO demo_shop_id
-      FROM shop s
-      JOIN app_user u ON u.shop_id = s.id
-     WHERE u.email = 'owner@demo.stockroom.dev'
-       AND s.name = 'Demo Sari-Sari Store';
+    SELECT id INTO demo_shop_id FROM shop WHERE is_demo;
 
     IF demo_shop_id IS NULL THEN
-        RAISE EXCEPTION 'Demo shop not found (owner@demo.stockroom.dev / Demo Sari-Sari Store). Nothing was deleted.';
+        RAISE EXCEPTION 'Demo shop not found (no shop with is_demo = true). Nothing was deleted.';
     END IF;
 
     DELETE FROM stock_movement WHERE shop_id = demo_shop_id;
@@ -4800,7 +5225,7 @@ END $$;
 
 - [ ] **Step 6: Run the tests, then the full suite**
 
-Run: `./mvnw -B test -Dtest='OpenApiTest,DemoDataSeederTest'`. Expected: `Tests run: 6, Failures: 0`.
+Run: `./mvnw -B test -Dtest='OpenApiTest,DemoDataSeederTest'`. Expected: `Tests run: 6, Failures: 0`. (Demo tests: seeds once, ledger, reset scoped by flag, seeder fails closed.)
 
 Run: `./mvnw -B test`. Expected: 0 failures.
 
@@ -4847,12 +5272,12 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_DB: stockroom_test
-          POSTGRES_USER: stockroom
-          POSTGRES_PASSWORD: stockroom
+          POSTGRES_USER: stockroom_test
+          POSTGRES_PASSWORD: stockroom_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U stockroom"
+          --health-cmd "pg_isready -U stockroom_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -4873,6 +5298,14 @@ jobs:
           path: |
             target/surefire-reports
             target/site/jacoco
+      # The deploy workflow ships THIS jar, the one the tests just passed on. It is never rebuilt.
+      - name: Upload application jar
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-jar
+          path: target/stockroom-api.jar
+          retention-days: 14
 ```
 
 - [ ] **Step 2: Run the same command locally**
@@ -4958,7 +5391,7 @@ WHERE id = :id AND shop_id = :shop AND active = true AND stock_qty >= :qty
 
 The check and the deduction are atomic, PostgreSQL's row lock makes the second order wait and then re-check, and `CHECK (stock_qty >= 0)` is a second safety net. Order lines are processed in product ID order so two orders can't deadlock. `ConcurrencyTest` proves it: **20 threads buy 1 unit of a product with 5 in stock, and exactly 5 succeed.**
 
-A related trap: JPA saving a whole `Product` row can write back a stale stock number. `stock_qty` is mapped `updatable = false`, so only the guarded UPDATE ever changes it (also covered by a test).
+A related trap: JPA saving a whole `Product` row can write back stale values. `stock_qty` is mapped `updatable = false`, so only the guarded UPDATE ever changes it, and `@DynamicUpdate` makes an edit write only the columns it changed, so it can't un-archive a product (race tests cover both).
 
 ## Run it locally
 
@@ -5034,7 +5467,7 @@ Follow one request, `POST /api/orders`, through the code:
 6. *What isolation level, and why is it enough?* PostgreSQL's default, READ COMMITTED. After waiting on the row lock, PostgreSQL re-evaluates the WHERE clause against the committed row, so the guard sees the new stock.
 7. *Why sort the lines by product ID?* So every transaction locks rows in the same order. Opposite orders ({A,B} vs {B,A}) could otherwise each hold one lock and wait forever for the other: a deadlock.
 8. *Is it deadlock-free?* Only as long as every multi-product writer follows the ordering rule. Cancel does. If one ever happens anyway, it becomes a retryable 409 `CONCURRENT_UPDATE`.
-9. *Why `updatable = false` on `stockQty`?* Hibernate updates all columns of a changed entity. Editing a product's name with an old copy would write the old stock back and erase a sale. With this mapping, JPA can never write stock.
+9. *Why `updatable = false` on `stockQty`, and why `@DynamicUpdate`?* By default Hibernate updates all columns of a changed entity. Editing a product's name with an old copy would write the old stock back and erase a sale, or write `active = true` back over an archive. `updatable = false` means JPA never writes stock; `@DynamicUpdate` means an edit only writes the columns it changed.
 10. *Why flush before and clear after the UPDATE?* Flush sends pending entity changes first; clear drops cached entities so nothing stale is used or re-saved afterwards.
 11. *What happens if line 2 of an order fails?* An exception leaves the `@Transactional` method, so everything rolls back, including line 1's deduction and the order row.
 12. *Why is the stock movement table append-only?* It's an audit trail: you can always explain the current stock. Test invariant: the sum of changes equals `stock_qty`.
@@ -5110,6 +5543,11 @@ spring:
     url: ${DB_URL}
     username: ${DB_USER}
     password: ${DB_PASSWORD}
+
+stockroom:
+  rate-limit:
+    # Only here: on App Service every request arrives through Azure's front end, which appends the client IP.
+    trust-forwarded-for: true
 ```
 
 Commit it: `git add -A && git commit -m "feat: production profile with required settings" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`.
@@ -5209,7 +5647,12 @@ Expected: one `app-out-N` rule per address, and **no** `AllowAllAzureServices` r
 ```bash
 ./mvnw -B -DskipTests package
 az webapp deploy --resource-group $RG --name $APP --src-path target/stockroom-api.jar --type jar
-for i in $(seq 1 30); do curl -fsS https://$APP.azurewebsites.net/actuator/health && break; sleep 10; done
+healthy=false
+for i in $(seq 1 30); do
+  if curl -fsS https://$APP.azurewebsites.net/actuator/health; then healthy=true; break; fi
+  sleep 10
+done
+[ "$healthy" = true ] || { echo "Health check never passed after 5 minutes"; exit 1; }
 TOKEN=$(curl -fsS -X POST https://$APP.azurewebsites.net/api/auth/login -H 'Content-Type: application/json' \
   -d '{"email":"owner@demo.stockroom.dev","password":"demo-owner-2026"}' | py -3.12 -c "import json,sys; print(json.load(sys.stdin)['accessToken'])")
 curl -fsS "https://$APP.azurewebsites.net/api/products?lowStock=true" -H "Authorization: Bearer $TOKEN"
@@ -5243,28 +5686,50 @@ on:
     types: [completed]
     branches: [main]
 
+# One deploy at a time; a queued run never cancels one that is mid-deploy.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   deploy:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # If an older CI run finishes after a newer one, don't let it replace the newer release.
+      - name: Skip if main has moved on
+        id: fresh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+          if [ "$latest" = "${{ github.event.workflow_run.head_sha }}" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "main is now at $latest; skipping the older ${{ github.event.workflow_run.head_sha }}"
+          fi
+      - name: Download the jar CI tested
+        if: steps.fresh.outputs.deploy == 'true'
+        uses: actions/download-artifact@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-      - name: Package
-        run: ./mvnw -B -DskipTests package
+          name: app-jar
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: dist
       - name: Deploy to Azure App Service
+        if: steps.fresh.outputs.deploy == 'true'
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ vars.AZURE_WEBAPP_NAME }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          package: target/stockroom-api.jar
+          package: dist/stockroom-api.jar
       - name: Smoke test
+        if: steps.fresh.outputs.deploy == 'true'
         run: |
           for i in $(seq 1 30); do
             curl -fsS "https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net/actuator/health" && exit 0
