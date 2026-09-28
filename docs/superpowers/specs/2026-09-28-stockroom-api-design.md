@@ -1,7 +1,7 @@
 # Stockroom API: Design Spec (Phase 1)
 
 - **Date:** 2026-09-28
-- **Status:** Revised after reviews 1 and 2 (see section 10); approved by the author
+- **Status:** Revised after reviews 1 and 2 (see section 10). The author approved the review-1 design; the review-2 changes are awaiting the author's OK
 - **Author:** Wrenz Ivan M. Laylo (design drafted with Claude)
 - **Reviewer:** GPT 6 Astra
 
