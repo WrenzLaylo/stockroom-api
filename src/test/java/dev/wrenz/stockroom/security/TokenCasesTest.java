@@ -51,6 +51,20 @@ class TokenCasesTest extends IntegrationTest {
         expectProblem(mvc.perform(get("/api/users").header("Authorization", "Bearer " + expired)), 401, "UNAUTHORIZED");
     }
 
+    /** Swagger keeps sending the last token; an expired one must never block getting a new one. */
+    @Test
+    void anExpiredTokenDoesNotBlockLoginOrRegister() throws Exception {
+        TestApi.Session owner = api.registerShop("Shop", "owner@shop.test");
+        Instant twoHoursAgo = Instant.now().minus(2, ChronoUnit.HOURS);
+        String expired = "Bearer " + encode(realEncoder, owner, twoHoursAgo, twoHoursAgo.plus(1, ChronoUnit.HOURS));
+        mvc.perform(post("/api/auth/login").header("Authorization", expired).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"owner@shop.test\",\"password\":\"password123\"}"))
+                .andExpect(status().isOk());
+        mvc.perform(post("/api/auth/register").header("Authorization", "Bearer garbage").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"shopName\":\"Two\",\"email\":\"two@shop.test\",\"password\":\"password123\"}"))
+                .andExpect(status().isCreated());
+    }
+
     @Test
     void staffOnAnOwnerEndpoint() throws Exception {
         TestApi.Session owner = api.registerShop("Shop", "owner@shop.test");

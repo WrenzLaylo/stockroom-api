@@ -11,6 +11,8 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.oauth2.server.resource.authentication.JwtGrantedAuthoritiesConverter;
+import org.springframework.security.oauth2.server.resource.web.BearerTokenResolver;
+import org.springframework.security.oauth2.server.resource.web.DefaultBearerTokenResolver;
 import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
 import org.springframework.security.web.SecurityFilterChain;
 
@@ -35,6 +37,16 @@ public class SecurityConfig {
                 .exceptionHandling(e -> e.authenticationEntryPoint(problems).accessDeniedHandler(problems))
                 .addFilterAfter(new UserIdRequestAttributeFilter(), BearerTokenAuthenticationFilter.class);
         return http.build();
+    }
+
+    /**
+     * Ignore any Authorization header on login and register. Otherwise an expired token (which Swagger
+     * UI keeps sending) is rejected with 401 before permitAll is checked, and the user can't log in again.
+     */
+    @Bean
+    BearerTokenResolver bearerTokenResolver() {
+        DefaultBearerTokenResolver standard = new DefaultBearerTokenResolver();
+        return request -> request.getRequestURI().startsWith("/api/auth/") ? null : standard.resolve(request);
     }
 
     @Bean

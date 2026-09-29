@@ -2,13 +2,16 @@ package dev.wrenz.stockroom.user;
 
 import dev.wrenz.stockroom.security.ClientIpResolver;
 import dev.wrenz.stockroom.security.RateLimitProperties;
+import io.swagger.v3.oas.annotations.security.SecurityRequirements;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 
+/** Empty @SecurityRequirements: Swagger UI must not attach the (possibly expired) token to these calls. */
 @RestController
 @RequestMapping("/api/auth")
+@SecurityRequirements
 public class AuthController {
 
     private final AuthService auth;
