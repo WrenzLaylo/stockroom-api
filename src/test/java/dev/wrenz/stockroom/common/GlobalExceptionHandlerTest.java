@@ -34,6 +34,10 @@ class GlobalExceptionHandlerTest {
         @GetMapping("/dup-sku") void dupSku() { throw integrity("uq_product_shop_sku"); }
         @GetMapping("/dup-email") void dupEmail() { throw integrity("uq_app_user_email"); }
         @GetMapping("/other-integrity") void otherIntegrity() { throw integrity("fk_order_item_product"); }
+        @GetMapping("/integrity-from-jdbc") void integrityFromJdbc() {
+            // JdbcTemplate (used by StockRepository) raises this with no Hibernate cause, so no constraint name.
+            throw new DataIntegrityViolationException("fk violation", new SQLException("violates foreign key"));
+        }
         @GetMapping("/deadlock") void deadlock() { throw new CannotAcquireLockException("deadlock detected"); }
         @GetMapping("/boom") void boom() { throw new IllegalStateException("secret internal detail"); }
         @GetMapping("/denied") void denied() { throw new AccessDeniedException("nope"); }
@@ -88,6 +92,12 @@ class GlobalExceptionHandlerTest {
     @Test
     void unknownIntegrityViolationIsA500NotAMisleading409() throws Exception {
         mvc.perform(get("/other-integrity")).andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.code").value("INTERNAL_ERROR"));
+    }
+
+    @Test
+    void integrityViolationWithoutAConstraintNameIsStillAProblemDetail() throws Exception {
+        mvc.perform(get("/integrity-from-jdbc")).andExpect(status().isInternalServerError())
                 .andExpect(jsonPath("$.code").value("INTERNAL_ERROR"));
     }
 

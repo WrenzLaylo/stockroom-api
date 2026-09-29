@@ -59,7 +59,9 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     @ExceptionHandler(DataIntegrityViolationException.class)
     ResponseEntity<ProblemDetail> handleIntegrity(DataIntegrityViolationException ex) {
-        Conflict conflict = KNOWN_CONSTRAINTS.get(constraintName(ex));
+        // JdbcTemplate errors carry no Hibernate cause, so the name can be null (Map.of rejects null keys).
+        String name = constraintName(ex);
+        Conflict conflict = name == null ? null : KNOWN_CONSTRAINTS.get(name);
         if (conflict != null) {
             return respond(HttpStatus.CONFLICT, conflict.code(), conflict.message());
         }
