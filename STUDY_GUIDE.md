@@ -64,7 +64,7 @@ Follow one request, `POST /api/orders`, through the code:
 
 30. *Why test against real PostgreSQL instead of H2?* Locking, constraint names and SQL behavior differ, and the concurrency tests only mean something on the real database.
 31. *How do you know the concurrency test isn't passing by luck?* Remove the `stock_qty >= ?` guard and it fails. I tried it. That kind of check also found a real bug: an error handler that crashed on database errors with no constraint name.
-32. *What does CI do?* Every push starts Postgres in a container and runs `./mvnw verify` (all tests plus coverage). Pushes to main deploy exactly the tested jar to Azure, after CI passes.
+32. *What does CI do?* Every push starts Postgres in a container and runs `./mvnw verify` (all tests plus coverage), and on `main` it keeps the tested jar as an artifact, so the deployment step ships exactly the jar the tests passed on instead of rebuilding it.
 33. *How did you use AI on this project?* Claude wrote the first version from a design I agreed and two external reviews. I reviewed every file, the tests prove the behavior, and I can change any part myself (see the practice change).
 
 ## Practice change (do this alone)

@@ -34,3 +34,6 @@ build/
 
 # Local secrets
 .env
+
+# Local tooling and agent scratch space (machine-specific paths)
+.superpowers/

@@ -300,7 +300,7 @@ Every error is an RFC 9457 `ProblemDetail` with an extra `code` property. Errors
 - **Demo data: seeded once, never reset automatically.**
   - The `demo` profile runs an idempotent seeder on startup. The demo shop is identified by its owner's email, `owner@demo.stockroom.dev`. Emails are globally unique, so nobody else can register it once the demo exists. If that user doesn't exist, the seeder creates the shop "Demo Sari-Sari Store", one OWNER, one STAFF and 15 products. If it already exists, **it does nothing**: it never resets data or changes passwords, so a deploy can't disrupt someone who is using the demo.
   - The demo profile is enabled only on the single public demo deployment, which **is** the demo environment and holds no real shop data. Any real deployment for a customer runs without `demo`.
-  - **Reset is a manual, guarded operation:** a SQL script in `ops/reset-demo.sql` that deletes only rows whose `shop_id` is the demo shop's. It finds that shop through the owner email **and** requires the shop name to match exactly; otherwise it raises an error and deletes nothing. It is run by hand when needed, never by CI.
+  - **Reset is a manual, guarded operation:** a SQL script in `ops/reset-demo.sql` that deletes only rows whose `shop_id` is the demo shop's. It finds that shop only through `is_demo = true` (see review 2, item 6); names and emails are never trusted. With no flagged shop it raises an error and deletes nothing. It is run by hand when needed, never by CI.
   - The demo logins are in the README.
 - **Cost gate:** no Azure resource is created until the author has seen the expected monthly cost and approved it.
 
