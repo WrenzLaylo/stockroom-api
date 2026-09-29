@@ -18,7 +18,7 @@ You are reviewing a design **before any code exists**. Please be critical: it is
 1. **Interview piece (Phase 1, this spec).** Show Java OOP, Spring Boot, Spring Security, JPA, transactions, testing, CI and Azure deployment. The design must be small enough that the author can explain every file and make a live change during an interview.
 2. **Product later (Phase 2, out of scope here).** It may later become a paid inventory tool for small shops (for example sari-sari stores in the Philippines), with an Angular front end. Phase 1 should not block that. In particular, multi-tenancy (one database, many shops) is designed in from the start.
 
-**How the code will be written.** Claude writes the implementation. The author then studies it file by file, with a study guide and a practice change they must complete alone. The target employer explicitly welcomes AI coding assistants when their output is validated, so AI assistance will be disclosed in commits.
+**How the code will be written.** Claude writes the implementation. The author then studies it file by file, with a study guide and a practice change they must complete alone. The target employer explicitly welcomes AI coding assistants when their output is validated, so AI assistance is disclosed in the README.
 
 **Please give your review in this format:**
 
