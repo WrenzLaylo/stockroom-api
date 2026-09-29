@@ -1,5 +1,6 @@
 package dev.wrenz.stockroom.support;
 
+import dev.wrenz.stockroom.security.LoginRateLimiter;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -22,12 +23,16 @@ public abstract class IntegrationTest {
     @Autowired
     protected JdbcTemplate jdbc;
 
+    @Autowired
+    protected LoginRateLimiter rateLimiter;
+
     protected TestApi api;
 
     @BeforeEach
     void resetDatabase() {
         TestDatabaseGuard.requireTestDatabase(jdbc);
         jdbc.execute("TRUNCATE stock_movement, order_item, customer_order, product, app_user, shop RESTART IDENTITY CASCADE");
+        rateLimiter.clear();
         api = new TestApi(mvc);
     }
 }

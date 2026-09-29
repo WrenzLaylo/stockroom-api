@@ -30,6 +30,7 @@ stockroom:
     max-failures-per-email: 5
     window: 15m
     max-keys: 10000
+    trust-forwarded-for: false
 
 management:
   endpoints:
