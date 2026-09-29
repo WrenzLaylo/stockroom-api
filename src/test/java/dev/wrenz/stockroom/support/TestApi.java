@@ -4,6 +4,7 @@ import com.jayway.jsonpath.JsonPath;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -47,6 +48,23 @@ public final class TestApi {
                                 """.formatted(email, PASSWORD)))
                 .andExpect(status().isCreated());
         return login(email, PASSWORD);
+    }
+
+    public long createProduct(Session owner, String sku, String price, int stock) throws Exception {
+        String json = mvc.perform(post("/api/products").header("Authorization", owner.bearer())
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"sku":"%s","name":"Product %s","price":%s,"initialStock":%d}
+                                """.formatted(sku, sku, price, stock)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        return ((Number) JsonPath.read(json, "$.id")).longValue();
+    }
+
+    public int stockOf(Session session, long productId) throws Exception {
+        String json = mvc.perform(get("/api/products/" + productId).header("Authorization", session.bearer()))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        return JsonPath.read(json, "$.stockQty");
     }
 
     private static Session session(String json) {
