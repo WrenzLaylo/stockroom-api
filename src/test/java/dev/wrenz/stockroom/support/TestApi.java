@@ -67,6 +67,16 @@ public final class TestApi {
         return JsonPath.read(json, "$.stockQty");
     }
 
+    public long placeOrder(Session session, long productId, int quantity) throws Exception {
+        String json = mvc.perform(post("/api/orders").header("Authorization", session.bearer())
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"items":[{"productId":%d,"quantity":%d}]}
+                                """.formatted(productId, quantity)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        return ((Number) JsonPath.read(json, "$.id")).longValue();
+    }
+
     private static Session session(String json) {
         return new Session(JsonPath.read(json, "$.accessToken"),
                 ((Number) JsonPath.read(json, "$.userId")).longValue(),
