@@ -22,9 +22,12 @@ public abstract class IntegrationTest {
     @Autowired
     protected JdbcTemplate jdbc;
 
+    protected TestApi api;
+
     @BeforeEach
     void resetDatabase() {
         TestDatabaseGuard.requireTestDatabase(jdbc);
         jdbc.execute("TRUNCATE stock_movement, order_item, customer_order, product, app_user, shop RESTART IDENTITY CASCADE");
+        api = new TestApi(mvc);
     }
 }
