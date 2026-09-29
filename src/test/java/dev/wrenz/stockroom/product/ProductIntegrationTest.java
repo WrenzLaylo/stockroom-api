@@ -161,6 +161,24 @@ class ProductIntegrationTest extends IntegrationTest {
         list(owner, "?size=0&page=-3").andExpect(jsonPath("$.size").value(1)).andExpect(jsonPath("$.page").value(0));
     }
 
+    /** PostgreSQL can't store a NUL character in text; that's bad input (400), not a server error. */
+    @Test
+    void nulCharactersAre400NotA500() throws Exception {
+        mvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"a\\u0000@shop.test\",\"password\":\"password123\"}"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+        create(owner, "{\"sku\":\"NUL\",\"name\":\"bad\\u0000name\",\"price\":1.00}")
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+        search("\u0000").andExpect(status().isOk());        // trim() strips a lone NUL: harmless empty search
+        search("a\u0000b").andExpect(status().isBadRequest()); // a NUL inside text reaches the database
+    }
+
+    @Test
+    void aHugePageNumberIsAnEmptyPageNotA500() throws Exception {
+        list(owner, "?page=30000000&size=100").andExpect(status().isOk())
+                .andExpect(jsonPath("$.content").isEmpty());
+    }
+
     @Test
     void nonNumericIdIs400() throws Exception {
         mvc.perform(get("/api/products/abc").header("Authorization", owner.bearer()))
@@ -185,6 +203,10 @@ class ProductIntegrationTest extends IntegrationTest {
     private ResultActions create(TestApi.Session s, String body) throws Exception {
         return mvc.perform(post("/api/products").header("Authorization", s.bearer())
                 .contentType(MediaType.APPLICATION_JSON).content(body));
+    }
+
+    private ResultActions search(String q) throws Exception {
+        return mvc.perform(get("/api/products").param("q", q).header("Authorization", owner.bearer()));
     }
 
     private ResultActions list(TestApi.Session s, String query) throws Exception {

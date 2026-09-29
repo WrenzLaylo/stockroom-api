@@ -16,8 +16,13 @@ public record PageResponse<T>(List<T> content, int page, int size, long totalEle
                 page.getTotalElements(), page.getTotalPages());
     }
 
-    /** Page numbers below 0 become 0; sizes are clamped to 1..100 (spec section 4). */
+    /**
+     * Page numbers below 0 become 0; sizes are clamped to 1..100 (spec section 4). The page is also capped
+     * so page * size fits in an int (the JPA offset): a huge page number returns an empty page, not a 500.
+     */
     public static Pageable pageable(int page, int size) {
-        return PageRequest.of(Math.max(page, 0), Math.min(Math.max(size, 1), MAX_SIZE));
+        int safeSize = Math.min(Math.max(size, 1), MAX_SIZE);
+        int safePage = Math.min(Math.max(page, 0), Integer.MAX_VALUE / safeSize - 1);
+        return PageRequest.of(safePage, safeSize);
     }
 }

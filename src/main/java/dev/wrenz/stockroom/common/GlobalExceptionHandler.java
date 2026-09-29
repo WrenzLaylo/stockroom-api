@@ -19,6 +19,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
+import java.sql.SQLException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -64,6 +65,10 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         Conflict conflict = name == null ? null : KNOWN_CONSTRAINTS.get(name);
         if (conflict != null) {
             return respond(HttpStatus.CONFLICT, conflict.code(), conflict.message());
+        }
+        // SQLSTATE class 22 = "data exception": the input itself can't be stored (e.g. a NUL character).
+        if (sqlState(ex).startsWith("22")) {
+            return respond(HttpStatus.BAD_REQUEST, "VALIDATION_FAILED", "The request contains a value that can't be stored");
         }
         log.error("Unexpected data integrity violation", ex);
         return respond(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Something went wrong");
@@ -120,6 +125,16 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         ProblemDetail pd = ProblemDetail.forStatusAndDetail(status, detail);
         pd.setProperty("code", code);
         return pd;
+    }
+
+    /** The SQLSTATE of the first SQLException in the cause chain, or "" if there is none. */
+    static String sqlState(Throwable ex) {
+        for (Throwable t = ex; t != null; t = t.getCause()) {
+            if (t instanceof SQLException sql && sql.getSQLState() != null) {
+                return sql.getSQLState();
+            }
+        }
+        return "";
     }
 
     /** Walks the cause chain to Hibernate's ConstraintViolationException and returns the constraint name. */
