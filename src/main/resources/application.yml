@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: stockroom-api
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/stockroom_dev}
+    username: ${DB_USER:stockroom}
+    password: ${DB_PASSWORD:stockroom}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: false   # extra fields (e.g. stockQty on PUT) are ignored, never applied
+
+server:
+  port: 8080
+  error:
+    include-stacktrace: never
+    include-message: never
+
+stockroom:
+  jwt:
+    secret: ${JWT_SECRET:}
+    ttl: 1h
+  rate-limit:
+    max-attempts-per-ip: 30
+    max-failures-per-email: 5
+    window: 15m
+    max-keys: 10000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+      show-components: never
+
+logging:
+  pattern:
+    level: "%5p [%X{requestId:-}]"
