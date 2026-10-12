@@ -1,7 +1,7 @@
 # Stockroom: Design Spec (Phase 2)
 
 - **Date:** 2026-10-12
-- **Status:** Draft for review. The design was approved section by section in conversation on 2026-10-12; this written spec is not yet approved.
+- **Status:** Revised after review 1 (section 13). The design was approved section by section in conversation on 2026-10-12; this written spec is not yet approved by the author.
 - **Author:** Wrenz Ivan M. Laylo (design drafted with Claude; architecture advice from Fable 5.1)
 - **Builds on:** `docs/superpowers/specs/2026-09-28-stockroom-api-design.md` (Phase 1, "the Phase 1 spec"). Section numbers like "P1 §6" point there.
 
@@ -87,16 +87,19 @@ Researched 2026-10-12 (sources in `.superpowers/sdd/2026-10-12-phase2/advisor-no
 - One jar on **App Service F1**, Linux, Java 21, Southeast Asia region. HTTPS Only is on.
 - **Neon Free** project in `aws-ap-southeast-1` (Singapore). The app uses Neon's **direct** connection string, not the `-pooler` one, because Flyway needs a direct connection.
 - Profiles on Azure: `prod,demo`. The `demo` profile runs the existing `DemoDataSeeder`.
-- **F1 limits the design accepts:** 1 GB memory, 60 CPU-minutes per day, no custom domain, the app is unloaded after 20 idle minutes, and if the daily CPU quota runs out the app returns 403 until midnight UTC (8 AM in Manila).
+- **F1 limits the design accepts:** 1 GB memory, 60 CPU-minutes per day, 165 MB of outbound traffic per day, no custom domain, the app is unloaded after 20 idle minutes, and if a daily quota runs out the app is stopped (403) until midnight UTC (8 AM in Manila). Hitting a quota stops the app; it never bills.
 
 ### 3.3 Production configuration (`application-prod.yml`)
 
 - `stockroom.rate-limit.trust-forwarded-for: true` (P1 §6 already requires this behind Azure's front end).
-- HikariCP `maximum-pool-size: 5` and `connection-timeout: 10s`, so a request that wakes Neon waits instead of failing.
-- JDBC URL with `sslmode=verify-full`.
+- **`server.forward-headers-strategy: none`, set explicitly in `application.yml` for every profile, with a comment saying why.** Spring Boot detects Azure App Service (from its `WEBSITE_*` environment variables) and then defaults this property to `native`, which installs Tomcat's `RemoteIpValve`. The valve takes the rightmost address as the client and **rewrites `X-Forwarded-For` to the remaining left-hand entries**. A request sent with `X-Forwarded-For: fake` would reach the app as `fake` only, and `ClientIpResolver` (which trusts the last entry, P1 §6) would rate-limit the forged address: the per-IP login limit would be bypassable, on Azure only, with every local test still green. A real-server test starts the app as if on Azure (`spring.main.cloud-platform=azure_app_service`) and proves a forged header still cannot move the client IP.
+- HikariCP `maximum-pool-size: 5`, `minimum-idle: 0`, `idle-timeout: 60s` and `connection-timeout: 10s`: a request that wakes Neon waits instead of failing, and the pool does not hold idle connections that could keep Neon's compute awake and spend its monthly compute hours.
+- JDBC URL with `sslmode=verify-full&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory`: full certificate and host-name checks against the JVM's trust store (pgjdbc's default factory would look for a root certificate file instead). Verified in M0 (section 12); if it fails, the fallback is `sslmode=require` with the reason recorded.
+- `server.compression.enabled: true`, and long-lived cache headers for Angular's content-hashed files, because F1 allows only 165 MB of outbound traffic per day (section 3.2).
 - JVM options (App Service setting `JAVA_OPTS`): `-XX:MaxRAMPercentage=70 -XX:TieredStopAtLevel=1`, chosen for a 1 GB box and a faster start.
-- **Swagger links behind TLS:** `OpenApiConfig` declares a relative server URL (`/`), so Swagger's "Try it out" calls use whatever scheme the page was loaded with. We do **not** turn on `server.forward-headers-strategy`: Spring's forwarded-header handling can rewrite the client address from `X-Forwarded-For`, which could undo the rate limiter's "last entry only" rule (P1 §6). M0 verifies this with a test either way.
+- **Swagger links behind TLS:** with forwarded headers off, the app sees plain HTTP behind Azure's TLS termination. `OpenApiConfig` therefore declares a relative server URL (`/`), so Swagger's "Try it out" calls use whatever scheme the page was loaded with.
 - Secrets (`DB_URL`, `DB_USER`, `DB_PASSWORD`, `JWT_SECRET`) live in App Service settings, never in git.
+- Neon's compute is capped at 0.25 CU (its smallest size), so the free 100 compute-hours a month last 400 hours of activity.
 
 ### 3.4 Continuous deployment
 
@@ -135,6 +138,7 @@ Researched 2026-10-12 (sources in `.superpowers/sdd/2026-10-12-phase2/advisor-no
 | Where the server keeps it | Nowhere (stateless) | SHA-256 hash only, in `refresh_token` |
 
 - Login and register return the access token in the body exactly as today (`TokenResponse`) **and** set the refresh cookie.
+- `Secure` is always on, including in development. Chrome and Firefox accept `Secure` cookies on `http://localhost`; Safari does not. So local development uses Chrome or Firefox, and the Playwright tests run on Chromium.
 - The access token keeps its claims (`sub`, `shopId`, `role`), but authority now comes from the database (section 4.4). The claims are still useful in logs and to detect a token from the wrong shop.
 
 ### 4.2 Data model: migration `V2__auth_sessions.sql`
@@ -174,12 +178,16 @@ CREATE INDEX ix_refresh_token_family ON refresh_token (family_id);
 2. Mark it used with a **conditional update**, the same idiom as the stock guard (P1 §5):
    `UPDATE refresh_token SET used_at = now() WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL`.
    One row updated means this request won.
-3. Zero rows updated means the token was **already used**. That is either a stolen token being replayed or two requests racing. Either way: revoke the whole family (`revoked_at = now()` on every row with that `family_id`), return 401 `REFRESH_REUSED`, clear the cookie.
+3. Zero rows updated means another transaction changed the row after step 1 read it. Re-read it:
+   - `used_at` is set: the token was **already used**, either a stolen token being replayed or two requests racing. Either way, revoke the whole family (`revoked_at = now()` on every row with that `family_id`), return 401 `REFRESH_REUSED`, clear the cookie.
+   - only `revoked_at` is set (a logout or a disable got there first): return 401 `REFRESH_INVALID`, clear the cookie.
 4. The winner inserts the successor token in the same family, sets the new cookie, and returns a fresh `TokenResponse` built from the user's **current** database role.
 
 **`POST /api/auth/logout`:** revokes the cookie's family (if any), clears the cookie, returns 204. Always 204, even without a cookie.
 
 **Races between refresh and revocation.** Family revocation (logout and step 3) runs as two statements in one transaction: first an `UPDATE` of the presented token's own row, which waits for any refresh of that token still in flight; then the `UPDATE ... WHERE family_id = ?`. Under PostgreSQL's default READ COMMITTED isolation the second statement sees rows committed after the first one waited, so a successor inserted by a racing refresh is revoked too. A concurrency test covers logout racing a refresh.
+
+**Disable racing a refresh.** Disabling has no token row to lock first, so a successor inserted by a refresh that commits during the disable can survive it unrevoked. That token is useless while the user is `DISABLED` (step 1 rejects it), so the gap is closed at the other end: **re-enabling a user also revokes all of their outstanding refresh tokens**. A re-enabled user always logs in again. A test covers it.
 
 **Housekeeping:** F1 unloads idle apps, so there is no `@Scheduled` cleanup. On every login, the user's expired and revoked rows are deleted, and if the user has more than 50 unrevoked families, the oldest are revoked. The demo owner is shared by every visitor, so this keeps its rows bounded.
 
@@ -192,18 +200,28 @@ CREATE INDEX ix_refresh_token_family ON refresh_token (family_id);
   - rejects with 401 `UNAUTHORIZED` if the user is missing, `DISABLED`, or belongs to a different shop than the token's `shopId` claim;
   - builds `ROLE_OWNER` / `ROLE_STAFF` from the **database** role, not the claim;
   - sets the principal to `AuthUser(userId, shopId, role)` loaded from the database.
+- **How a rejection becomes a 401:** Spring Security only sends `AuthenticationException`s to the entry point that writes the 401 `ProblemDetail` (P1 §6). The converter therefore throws an `AuthenticationException` subclass (for example `InvalidBearerTokenException` or `DisabledException`), **not** the app's own `UnauthorizedException`, which is an ordinary `RuntimeException` and would surface as a 500.
+- **A database failure is not a 401.** If the lookup itself fails (for example Neon is unreachable), the response is 500 `INTERNAL_ERROR` in the standard shape, never 401: a 401 would make the Angular interceptor log every user out because of a database hiccup. A test simulates a failing lookup and asserts the 500 and its shape.
+- The lookup runs in the security filter, outside any transaction (`open-in-view` is off), so it borrows a connection briefly and returns it before the controller's own work starts. With a pool of 5 that is fine.
 - **No cache.** A cache would bring back the stale window this feature removes. The cost is one indexed read per request on endpoints that already use the database.
 - Controllers change from `AuthUser.from(jwt)` to `@AuthenticationPrincipal AuthUser`. `UserIdRequestAttributeFilter` must recognise the new authentication type, or request logs silently lose `user=`. A test asserts the log attribute is still set.
 - This replaces the Phase 1 "stale claims" limitation (P1 §6); the README section about it is rewritten.
 
-### 4.5 Managing users (owner only)
+### 4.5 Managing users
 
-| Endpoint | Body | Effect |
-|---|---|---|
-| `GET /api/me` | | Current user from the database: `id, email, role, status, shopId, shopName` |
-| `GET /api/users` (exists) | | Now includes `status` |
-| `PATCH /api/users/{id}` | `{ "role"?: "OWNER"\|"STAFF", "status"?: "ACTIVE"\|"DISABLED" }` (at least one field) | Changes role and/or status |
-| `DELETE /api/users/{id}` | | Same as `PATCH {status: DISABLED}`; returns 204 |
+| Endpoint | Who | Body | Effect |
+|---|---|---|---|
+| `GET /api/me` | owner, staff | | Current user from the database: `id, email, role, status, shopId, shopName` |
+| `GET /api/users` (exists) | owner | | Now includes `status` |
+| `PATCH /api/users/{id}` | owner | `{ "role"?: "OWNER"\|"STAFF", "status"?: "ACTIVE"\|"DISABLED" }` | Changes role and/or status; returns the updated user |
+
+There is deliberately no `DELETE`: "remove" is `PATCH {status: DISABLED}`, and one route per effect is easier to explain.
+
+`PATCH` details:
+
+- An empty body (neither field) → 400 `VALIDATION_FAILED`.
+- Setting a value the user already has is a no-op that returns 200 (idempotent).
+- A disabled user's role may be changed. Only `ACTIVE` owners count for the last-owner rule.
 
 Rules, checked in one service method inside a transaction:
 
@@ -218,7 +236,7 @@ Rules, checked in one service method inside a transaction:
 ### 4.6 Forged-request protection and rate limits
 
 - The refresh cookie makes `/api/auth/refresh` and `/api/auth/logout` cookie-authenticated, so the Phase 1 comment "CSRF disabled because there are no cookies" becomes false and is rewritten.
-- `SameSite=Strict` already stops other sites from sending the cookie. As a second check, both endpoints reject a request whose `Sec-Fetch-Site` header is `cross-site` or `same-site`, or whose `Origin` header is present and is not the app's own origin → 403 `FORBIDDEN`. The app's own origin comes from a property, `stockroom.app-origin` (`prod`: the `https://….azurewebsites.net` address; default: `http://localhost:4200`, the `ng serve` address). Spring's CSRF tokens stay off; the Bearer endpoints are not cookie-authenticated and need none.
+- `SameSite=Strict` already stops other sites from sending the cookie. As a second check, both endpoints reject a request whose `Sec-Fetch-Site` header is present and is anything other than `same-origin` → 403 `FORBIDDEN`. Current Chrome, Edge, Firefox and Safari send this header on every request. Requests without it (curl, other non-browser clients) are allowed: a forged cross-site request needs a browser that sends the victim's cookie automatically, and a browser too old to send `Sec-Fetch-Site` still honours `SameSite=Strict`. The rule needs no configured origin, so it works the same in production, behind the `ng serve` proxy, on a bare local jar, in Playwright and in Swagger. Spring's CSRF tokens stay off; the Bearer endpoints are not cookie-authenticated and need none.
 - The existing `BearerTokenResolver` already ignores `Authorization` on `/api/auth/**`, which fits: refresh and logout are cookie-only and `permitAll`.
 - **Rate limit:** refresh gets its own per-IP counter (60 per 15 minutes, same Caffeine design as P1 §6), so normal use never eats into the login budget. Login and register keep their Phase 1 limits.
 
@@ -231,10 +249,13 @@ Rules, checked in one service method inside a transaction:
 - Expired, family-expired, revoked and unknown tokens → `REFRESH_INVALID`.
 - Logout revokes and clears; logout without a cookie → 204.
 - Logout racing a refresh of the same token: afterwards, no token in the family works.
-- Cross-site `Sec-Fetch-Site` and a foreign `Origin` → 403.
+- `Sec-Fetch-Site: cross-site` and `same-site` → 403; `same-origin` and a missing header → allowed.
 - A disabled user's access token is rejected on its next request; their refresh fails.
 - A demoted owner gets 403 on owner endpoints on the next request.
-- `LAST_OWNER`, `CANNOT_CHANGE_SELF`, `DEMO_ACCOUNT_PROTECTED`, and cross-shop 404 on `PATCH`/`DELETE`.
+- `LAST_OWNER`, `CANNOT_CHANGE_SELF`, `DEMO_ACCOUNT_PROTECTED`, cross-shop 404 on `PATCH`, empty `PATCH` body → 400, and a repeated `PATCH` → 200 no-op.
+- A refresh racing a disable: after re-enabling, no token issued before the disable works.
+- A failing user lookup in the security filter → 500 `INTERNAL_ERROR` in the standard shape, not 401.
+- The app started as if on Azure (`spring.main.cloud-platform=azure_app_service`, real server) still ignores a forged `X-Forwarded-For` entry (section 3.3).
 - Two owners demoting each other concurrently: one succeeds, one gets `LAST_OWNER`.
 - Request logs still include the user ID.
 - 401 responses from Bearer-protected endpoints include `WWW-Authenticate: Bearer` (section 8.2).
@@ -249,7 +270,7 @@ Rules, checked in one service method inside a transaction:
 - Reads use `httpResource`; writes use `HttpClient`.
 - **State:** small feature services holding signals, plus one `AuthStore`. No NgRx: nothing to learn beyond signals.
 - **UI kit:** Angular Material 22 with a custom Material 3 theme (applied in the design pass, section 10.3).
-- **Package manager:** npm. `package-lock.json` is committed and CI installs with `npm ci`. The Node version is pinned to an LTS release supported by Angular 22, in one place used by local development, CI and the Maven build.
+- **Package manager:** npm. `package-lock.json` is committed and CI installs with `npm ci`. The Node version is pinned to an LTS release supported by Angular 22 in two places: `web/.nvmrc` (local development, and CI through `setup-node`'s `node-version-file`) and the pom's `<nodeVersion>` (the Maven build). A CI step fails if the two differ.
 
 ### 5.2 Structure (`web/src/app/`)
 
@@ -260,7 +281,7 @@ Rules, checked in one service method inside a transaction:
 ### 5.3 Login flow
 
 - `AuthStore` holds the access token, its expiry, and the current user from `GET /api/me`, all in memory.
-- **Interceptor:** attaches `Authorization: Bearer …` to API requests. On a 401 from any non-`/api/auth/*` URL it calls `AuthStore.refresh()`. `refresh()` keeps **one in-flight request** and hands the same result to every concurrent caller; each failed request is retried once with the new token. If the refresh fails, the store is cleared and the router goes to `/login?returnUrl=<current path>`.
+- **Interceptor:** attaches `Authorization: Bearer …` to API requests. On a 401 from any non-`/api/auth/*` URL it calls `AuthStore.refresh()`. `refresh()` keeps **one in-flight request** and hands the same result to every concurrent caller; each failed request is retried once with the new token. If the refresh answers 401 or 429, the store is cleared and the router goes to `/login?returnUrl=<current path>` (a 429 also shows "Too many attempts, try again in a few minutes"). If the refresh fails with a network error or a 5xx, the session is kept and the request shows the Retry message (section 8.3): a server hiccup never logs anyone out.
 - **On page load:** an app initializer calls `refresh()` once. If the cookie is valid, the session is restored without a login screen.
 - **Guards:** an `authGuard` for signed-in routes and an `ownerGuard` for owner-only routes. They only hide UI; the server remains the gatekeeper.
 
@@ -288,7 +309,7 @@ Every screen works down to 390 px wide.
 ### 5.6 Tests
 
 - **Vitest** (the Angular CLI default): the interceptor (single-flight refresh, retry once, redirect on failure), guards, `AuthStore`, the error mapper, and the order form.
-- **Playwright** browser tests against the real jar and PostgreSQL:
+- **Playwright** browser tests on Chromium (section 4.1) against the real jar and PostgreSQL:
   1. Log in, reload the page, still signed in.
   2. Place an order and see the product's stock drop.
   3. The owner disables a staff member; that staff member's open session is sent to the login page on its next action.
@@ -331,23 +352,28 @@ The low-stock **list** reuses the existing `GET /api/products?lowStock=true`.
 - **Days** are calendar days in the shop's time zone: an order belongs to `(created_at AT TIME ZONE shop.timezone)::date`.
 - `today` is the current date in the shop's time zone. `last7Days` is today plus the 6 days before; `last30Days` is today plus the 29 days before.
 - `sales-by-day`: `from` and `to` are ISO dates, inclusive, defaulting to the last 30 days. More than 92 days, or `from` after `to` → 400 `VALIDATION_FAILED`.
-- `top-products`: total quantity sold in `PLACED` orders over the last `days` days (1 to 92, default 30), `limit` 1 to 20 (default 5), ties broken by name. Quantities only: no money, so staff may see it.
+- `top-products`: total quantity sold in `PLACED` orders over the last `days` days (1 to 92, default 30), `limit` 1 to 20 (default 5), ties broken by name. Quantities only, no revenue, so staff may see it.
 - Archived products still appear in `top-products` (they were sold), and are excluded from `activeProducts` and `lowStockCount`.
-- The existing index `ix_order_shop_created (shop_id, created_at DESC)` covers the date-range scans.
+- **Queries filter on raw `created_at` bounds so the index is used:** `WHERE shop_id = ? AND created_at >= (:from::timestamp AT TIME ZONE :tz) AND created_at < ((:to + 1)::timestamp AT TIME ZONE :tz)`, and only the `GROUP BY` uses the date expression. Filtering on `(created_at AT TIME ZONE tz)::date` would be an expression the index `ix_order_shop_created (shop_id, created_at DESC)` cannot serve.
 
 ### 6.4 The page
 
 - **Owner:** sales tiles for today, 7 days and 30 days; a 30-day sales bar chart; top sellers; the low-stock list linking to restock.
-- **Staff:** the low-stock list, product counts and top sellers; no money anywhere.
+- **Staff:** the low-stock list, product counts and top sellers; no sales totals or revenue. (Staff already see prices and individual order totals in Phase 1; only the aggregates are owner-only.)
 - **Chart:** a hand-written inline-SVG bar chart component (no chart library), with an accessible text summary and a value on hover or focus.
 
 ### 6.5 Demo data
 
-`DemoDataSeeder` adds about 30 days of orders to the demo shop, including a few cancellations. They are created **through the normal order service**, so stock and the stock ledger stay consistent (P1 §5), and then their `created_at` values (orders and their stock movements) are moved back in time with `JdbcTemplate`. The reset script plus a restart re-creates them, as in Phase 1.
+`DemoDataSeeder` adds about 30 days of orders to the demo shop, including a few cancellations:
+
+- Orders are created **through the normal order service**, so stock and the stock ledger stay consistent (P1 §5). The seed is one transaction, so a single `INSUFFICIENT_STOCK` would roll back everything and stop the app. The opening stock levels are therefore raised so that the planned sales fit, and chosen so that two products still end **below** their low-stock threshold, which keeps the low-stock panel and the restock flow demonstrable.
+- After the orders exist, timestamps are moved back with `JdbcTemplate` so the history reads in order: product `created_at` and the `OPENING_STOCK` movements go back about 31 days; each order's `created_at`, `cancelled_at`, and its `SALE` and `CANCEL` movements go back to that order's planned day.
+- `DemoDataSeederTest`'s expected counts are updated.
+- **The live demo does not re-seed by itself:** the seeder skips an existing demo shop. M5's deployment therefore includes an explicit step: run `ops/reset-demo.sql` against Neon, then restart the app.
 
 ### 6.6 Tests (M5)
 
-- An order at 11:30 PM Manila time counts on that Manila date, not the next (UTC) date.
+- An order at `2026-10-12T17:00Z` (1:00 AM on 13 October in Manila) counts on 13 October, not on its UTC date of 12 October. (A late-evening Manila order would not catch the bug: 11:30 PM in Manila is still the same date in UTC.)
 - Cancelled orders are excluded from counts and revenue.
 - Zero-filled days, the inclusive range, the 92-day cap, and `from` after `to`.
 - Staff get 403 on `/sales` and `/sales-by-day`, and 200 on `/stock` and `/top-products`.
@@ -363,7 +389,7 @@ The low-stock **list** reuses the existing `GET /api/products?lowStock=true`.
 | Changed | `POST /api/auth/login`, `POST /api/auth/register` also set the refresh cookie | M1 |
 | New | `GET /api/me` | M1 |
 | Changed | `GET /api/users` adds `status` | M1 |
-| New | `PATCH /api/users/{id}`, `DELETE /api/users/{id}` | M1 |
+| New | `PATCH /api/users/{id}` (role and status) | M1 |
 | New | `GET /api/reports/stock`, `/sales`, `/sales-by-day`, `/top-products` | M5 |
 | Changed | Access tokens last 15 minutes instead of 1 hour | M1 |
 
@@ -450,7 +476,7 @@ UI work uses the design-taste skill. The Material theme, typography and colour a
 
 ### 10.4 Documentation
 
-- **README:** live link and demo logins, the free-tier note, an updated architecture diagram (browser → Spring Boot on App Service F1 → Neon), the refresh-token and live-check story, the tab-race known limit, and the AI-assistance disclosure kept.
+- **README:** live link and demo logins, the free-tier note, an updated architecture diagram (browser → Spring Boot on App Service F1 → Neon), the refresh-token and live-check story, the tab-race known limit, and the AI-assistance disclosure kept. "What I'd do next" gains security headers: the app sees plain HTTP behind Azure's TLS termination (section 3.3), so Spring Security does not send HSTS, and the single-page app has no Content-Security-Policy yet.
 - **Study guide:** new chapters on the refresh flow, the per-request check, the Angular structure and the interceptor; and one practice change the author completes alone.
 - **Repository rename** (`stockroom-api` → `stockroom`): decided in M6. GitHub redirects the old URL, so links already sent keep working.
 
@@ -470,7 +496,7 @@ UI work uses the design-taste skill. The Material theme, typography and colour a
 | D4 | Reuse response | Revoke the whole family | Revoke only the presented token (weaker; RFC 9700 requires rotation or sender-constraining, and family revocation is the common stricter variant) |
 | D5 | Live check | One primary-key lookup per request, no cache | `token_version` claim (still needs the row for the new role); a cache (brings back the stale window) |
 | D6 | Remove staff | Disable (soft) with re-enable | Hard delete (orders and movements reference users) |
-| D7 | Forged requests | `SameSite=Strict` + `Sec-Fetch-Site`/`Origin` check on two endpoints | Spring CSRF tokens (more moving parts for the same protection here) |
+| D7 | Forged requests | `SameSite=Strict` + `Sec-Fetch-Site` check on two endpoints | Spring CSRF tokens (more moving parts for the same protection here); an `Origin` allow-list (needs a configured origin per environment and broke local runs in review) |
 | D8 | Angular state | Signals in feature services | NgRx (more to learn, no benefit at this size) |
 | D9 | UI kit | Angular Material | Tailwind with hand-built components (more code to own, accessibility on us) |
 | D10 | Package manager | npm | pnpm (its strengths are monorepos and disk use), Yarn (no benefit here) |
@@ -486,10 +512,12 @@ These were researched but not proven on this project. Each is checked in the mil
 
 | Fact | Check | Milestone |
 |---|---|---|
-| F1 appends the real client IP as the **last** `X-Forwarded-For` entry | Forged-header request against the live app | M0 |
+| F1 appends the real client IP as the **last** `X-Forwarded-For` entry, and the explicit `forward-headers-strategy: none` holds on Azure | Forged-header request against the live app: the forged value must not be the limited key | M0 |
 | Spring Boot cold start on F1 is acceptable | Measured (section 3.5) | M0 |
-| Not enabling `server.forward-headers-strategy` keeps Swagger working over HTTPS with a relative server URL | Use Swagger on the live app | M0 |
-| Neon's direct connection works with Flyway and survives Neon suspending | Deploy, idle past Neon's suspend time, call the API | M0 |
+| Swagger works over HTTPS with the relative server URL | Use "Try it out" on the live app | M0 |
+| `sslmode=verify-full` with `DefaultJavaSSLFactory` connects to Neon (its certificate chains to a CA in the JVM trust store) | First deploy | M0 |
+| Neon's direct connection works with Flyway and survives Neon suspending | Deploy, idle past Neon's 5-minute suspend, call the API | M0 |
+| With `minimum-idle: 0`, Neon still suspends while F1 keeps the app loaded (Neon's docs don't say whether idle connections block suspend) | Neon console after 10 idle minutes | M0 |
 | GitHub OIDC login to Azure works on a free/pay-as-you-go personal account | First CD run | M0 |
 | Angular 22 + Vitest is the CLI default and works with zoneless | Scaffold | M2 |
 | `frontend-maven-plugin` runs the pinned Node and `npm ci` on GitHub's Ubuntu runner | First `-Pweb` CI run | M2 |
@@ -498,4 +526,20 @@ These were researched but not proven on this project. Each is checked in the mil
 
 ## 13. Review log
 
-(Filled in after the review.)
+**Review 1: Fable 5.1, fresh reviewer, 2026-10-12. Verdict: "Ready with fixes".** Every finding was checked against the code before it was accepted.
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | On Azure, Spring Boot defaults `forward-headers-strategy` to `native`; Tomcat's `RemoteIpValve` rewrites `X-Forwarded-For`, so `ClientIpResolver` (verified: trusts the last entry) would rate-limit a forged address | Accepted. Explicit `none` in `application.yml`, a real-server test as if on Azure, live check in M0 (3.3, 4.7, 12) |
+| B2 | The time-zone test used 11:30 PM Manila, which is the same date in UTC, so it could not fail | Accepted. Uses 1:00 AM Manila (6.6) |
+| S1 | `Origin` check with a `localhost:4200` default would 403 Playwright, local `-Pweb` runs and Swagger, because browsers send `Origin` on same-origin POSTs | Accepted, with a simpler fix than suggested: dropped the `Origin` rule and the property; `Sec-Fetch-Site` must be `same-origin` when present (4.6, D7) |
+| S2 | Converter exceptions reach the 401 entry point only if they are `AuthenticationException`s; `UnauthorizedException` (verified: a `RuntimeException`) would give a 500. A DB failure must not become a 401 | Accepted (4.4, 4.7) |
+| S3 | A disable racing a refresh can leave a successor token unrevoked; zero updated rows can also mean a concurrent logout | Accepted. Re-enable revokes all tokens; zero rows are re-read to choose `REFRESH_REUSED` or `REFRESH_INVALID` (4.3) |
+| S4 | Seeding 30 days of orders through the order service would hit `INSUFFICIENT_STOCK` with today's demo stock (verified: e.g. shampoo 3, oil 25) and roll back the seed | Accepted. Raised opening stock, two items end low, full backdating, explicit reset step (6.5) |
+| S5 | Hikari keeps idle connections that may keep Neon awake; F1 also caps outbound traffic at 165 MB/day | Accepted. `minimum-idle: 0`, 0.25 CU cap, compression and caching (3.2, 3.3, 12) |
+| S6 | Bucketing in the `WHERE` clause defeats the order index | Accepted. Raw `created_at` bounds (6.3) |
+| S7 | Safari rejects `Secure` cookies on `http://localhost` | Accepted. Chromium for Playwright; Chrome or Firefox for development (4.1) |
+| S8 | Ambiguities: empty `PATCH`, idempotent `PATCH`, role change while disabled, refresh 429 in the interceptor, "no money" for staff, Node pinned "in one place" | Accepted, each pinned (4.5, 5.1, 5.3, 6.4) |
+| Scope | `DELETE /api/users/{id}` duplicates `PATCH {status: DISABLED}` | Accepted. Removed (4.5, 7) |
+| Scope | No HSTS behind TLS termination | Accepted as a README "what I'd do next" item (10.4) |
+| Unverified | `sslmode=verify-full` with pgjdbc's default factory needs a root certificate file | Accepted. `DefaultJavaSSLFactory`, verified in M0 (3.3, 12) |
