@@ -1,7 +1,7 @@
 # Stockroom: Design Spec (Phase 2)
 
 - **Date:** 2026-10-12
-- **Status:** Revised after review 1 (section 13). The design was approved section by section in conversation on 2026-10-12; this written spec is not yet approved by the author.
+- **Status:** Revised after review 1 (section 13). Approved by the author 2026-10-12.
 - **Author:** Wrenz Ivan M. Laylo (design drafted with Claude; architecture advice from Fable 5.1)
 - **Builds on:** `docs/superpowers/specs/2026-09-28-stockroom-api-design.md` (Phase 1, "the Phase 1 spec"). Section numbers like "P1 §6" point there.
 
