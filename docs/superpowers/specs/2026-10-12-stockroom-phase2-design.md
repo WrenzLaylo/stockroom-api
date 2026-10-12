@@ -196,15 +196,16 @@ CREATE INDEX ix_refresh_token_family ON refresh_token (family_id);
 ### 4.4 Live checks on every request
 
 - `app_user.status` is `ACTIVE` or `DISABLED`.
-- A custom `Converter<Jwt, AbstractAuthenticationToken>` replaces the current role-claim converter. After the signature and expiry checks it does **one primary-key lookup** and:
+- **The token alone grants no role.** Spring still checks the signature and expiry, but the JWT converter now produces no authorities.
+- A new `CurrentUserFilter` runs right after Spring's bearer-token filter. For every token-authenticated request it does **one primary-key lookup** and:
   - rejects with 401 `UNAUTHORIZED` if the user is missing, `DISABLED`, or belongs to a different shop than the token's `shopId` claim;
-  - builds `ROLE_OWNER` / `ROLE_STAFF` from the **database** role, not the claim;
-  - sets the principal to `AuthUser(userId, shopId, role)` loaded from the database.
-- **How a rejection becomes a 401:** Spring Security only sends `AuthenticationException`s to the entry point that writes the 401 `ProblemDetail` (P1 §6). The converter therefore throws an `AuthenticationException` subclass (for example `InvalidBearerTokenException` or `DisabledException`), **not** the app's own `UnauthorizedException`, which is an ordinary `RuntimeException` and would surface as a 500.
+  - replaces the authentication with one whose roles (`ROLE_OWNER` / `ROLE_STAFF`) come from the **database** row, not the claim, and whose principal is `AuthUser(userId, shopId, role)` from that row;
+  - records the user ID for the request log. It replaces `UserIdRequestAttributeFilter`, so request logs keep `user=`; a test asserts it.
+- **Why a filter and not a JWT converter** (decided while planning, 2026-10-12): Spring Security sends only `AuthenticationException`s to the entry point that writes the 401 `ProblemDetail` (P1 §6). Any other exception from inside the security filters, such as a database error, would skip `GlobalExceptionHandler` and reach Spring Boot's default error page, in a different JSON shape. The filter catches both cases itself and hands them to the same exception resolver `ProblemSecurityHandlers` already uses, so every error keeps the standard shape.
 - **A database failure is not a 401.** If the lookup itself fails (for example Neon is unreachable), the response is 500 `INTERNAL_ERROR` in the standard shape, never 401: a 401 would make the Angular interceptor log every user out because of a database hiccup. A test simulates a failing lookup and asserts the 500 and its shape.
 - The lookup runs in the security filter, outside any transaction (`open-in-view` is off), so it borrows a connection briefly and returns it before the controller's own work starts. With a pool of 5 that is fine.
 - **No cache.** A cache would bring back the stale window this feature removes. The cost is one indexed read per request on endpoints that already use the database.
-- Controllers change from `AuthUser.from(jwt)` to `@AuthenticationPrincipal AuthUser`. `UserIdRequestAttributeFilter` must recognise the new authentication type, or request logs silently lose `user=`. A test asserts the log attribute is still set.
+- Controllers change from `AuthUser.from(jwt)` to `@AuthenticationPrincipal AuthUser`.
 - This replaces the Phase 1 "stale claims" limitation (P1 §6); the README section about it is rewritten.
 
 ### 4.5 Managing users
@@ -494,7 +495,7 @@ UI work uses the design-taste skill. The Material theme, typography and colour a
 | D2 | Hosting | App Service F1 + Neon Free | Container Apps (small bill risk, unverified meter; kept as the fallback in 3.5); Azure PostgreSQL (not free after 12 months); others in 3.1 |
 | D3 | Refresh token storage | `HttpOnly; Secure; SameSite=Strict` cookie, hash in the database | Local storage (readable by any injected script) |
 | D4 | Reuse response | Revoke the whole family | Revoke only the presented token (weaker; RFC 9700 requires rotation or sender-constraining, and family revocation is the common stricter variant) |
-| D5 | Live check | One primary-key lookup per request, no cache | `token_version` claim (still needs the row for the new role); a cache (brings back the stale window) |
+| D5 | Live check | One primary-key lookup per request in `CurrentUserFilter`, no cache | `token_version` claim (still needs the row for the new role); a cache (brings back the stale window); a JWT converter doing the lookup (a database error would bypass the standard error shape, section 4.4) |
 | D6 | Remove staff | Disable (soft) with re-enable | Hard delete (orders and movements reference users) |
 | D7 | Forged requests | `SameSite=Strict` + `Sec-Fetch-Site` check on two endpoints | Spring CSRF tokens (more moving parts for the same protection here); an `Origin` allow-list (needs a configured origin per environment and broke local runs in review) |
 | D8 | Angular state | Signals in feature services | NgRx (more to learn, no benefit at this size) |
@@ -543,3 +544,5 @@ These were researched but not proven on this project. Each is checked in the mil
 | Scope | `DELETE /api/users/{id}` duplicates `PATCH {status: DISABLED}` | Accepted. Removed (4.5, 7) |
 | Scope | No HSTS behind TLS termination | Accepted as a README "what I'd do next" item (10.4) |
 | Unverified | `sslmode=verify-full` with pgjdbc's default factory needs a root certificate file | Accepted. `DefaultJavaSSLFactory`, verified in M0 (3.3, 12) |
+
+**Plan-time refinement (2026-10-12, while writing the M1 plan):** section 4.4 moved the per-request lookup from a JWT converter into `CurrentUserFilter`, because a database error thrown inside the converter would bypass `GlobalExceptionHandler` and reach Spring Boot's default error page in a different JSON shape. Behaviour is unchanged; only the mechanism moved.
